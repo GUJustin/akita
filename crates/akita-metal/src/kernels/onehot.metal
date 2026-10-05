@@ -143,6 +143,8 @@ struct PackedDecomposeFoldParams {
     ulong challenge_weight;
     ulong output_coefficients;
     ulong zero_column_mask;
+    ulong onehot_k;
+    ulong zero_suffix_start;
 };
 
 struct PackedFoldIndexParams {
@@ -1100,17 +1102,23 @@ kernel void akita_fp128_d512_decompose_fold(
         &accumulators[thread_index + 256u], 0, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    ulong row_shift = params.onehot_k == 16ul ? 5ul : 1ul;
+    ulong rows_per_ring = 1ul << row_shift;
+    ulong active_rings = (params.zero_suffix_start + rows_per_ring - 1ul) >> row_shift;
+    ulong active_blocks = active_rings > position
+        ? (active_rings - position + params.num_positions - 1ul) / params.num_positions
+        : 0ul;
     ulong tasks_per_position =
-        params.blocks_per_column * params.num_columns * 2ul;
+        active_blocks * params.num_columns * rows_per_ring;
     for (ulong task = (ulong)thread_index;
          task < tasks_per_position;
          task += 256ul) {
-        ulong trace_block = task / (params.num_columns * 2ul);
-        ulong block_local = task % (params.num_columns * 2ul);
-        ulong column = block_local >> 1ul;
-        ulong row_in_ring = block_local & 1ul;
+        ulong trace_block = task / (params.num_columns * rows_per_ring);
+        ulong block_local = task % (params.num_columns * rows_per_ring);
+        ulong column = block_local >> row_shift;
+        ulong row_in_ring = block_local & (rows_per_ring - 1ul);
         ulong ring = trace_block * params.num_positions + position;
-        ulong row = ring * 2ul + row_in_ring;
+        ulong row = ring * rows_per_ring + row_in_ring;
         uchar hot = lanes[row * params.lane_stride + column];
         bool committed = hot != 0u;
         if (!committed && column < 64ul
@@ -1122,7 +1130,7 @@ kernel void akita_fp128_d512_decompose_fold(
             continue;
         }
 
-        uint source_coefficient = (uint)(row_in_ring * 256ul) + (uint)hot;
+        uint source_coefficient = (uint)(row_in_ring * params.onehot_k) + (uint)hot;
         ulong challenge = column * params.blocks_per_column + trace_block;
         ulong challenge_start = challenge * params.challenge_weight;
         for (ulong term = 0ul; term < params.challenge_weight; ++term) {
@@ -1162,8 +1170,14 @@ kernel void akita_fp128_d512_subring64_decompose_fold(
     uint simdgroup = thread_index >> 5u;
     uint local_position = threadgroup_index.x;
     ulong position = params.position_start + (ulong)local_position;
+    ulong row_shift = params.onehot_k == 16ul ? 5ul : 1ul;
+    ulong rows_per_ring = 1ul << row_shift;
+    ulong active_rings = (params.zero_suffix_start + rows_per_ring - 1ul) >> row_shift;
+    ulong active_blocks = active_rings > position
+        ? (active_rings - position + params.num_positions - 1ul) / params.num_positions
+        : 0ul;
     ulong tasks_per_position =
-        params.blocks_per_column * params.num_columns * 2ul;
+        active_blocks * params.num_columns * rows_per_ring;
     int accumulator_low = 0;
     int accumulator_high = 0;
 
@@ -1176,12 +1190,12 @@ kernel void akita_fp128_d512_subring64_decompose_fold(
         uint source_high = 0u;
         uint challenge = 0u;
         if (valid) {
-            ulong trace_block = task / (params.num_columns * 2ul);
-            ulong block_local = task % (params.num_columns * 2ul);
-            ulong column = block_local >> 1ul;
-            ulong row_in_ring = block_local & 1ul;
+            ulong trace_block = task / (params.num_columns * rows_per_ring);
+            ulong block_local = task % (params.num_columns * rows_per_ring);
+            ulong column = block_local >> row_shift;
+            ulong row_in_ring = block_local & (rows_per_ring - 1ul);
             ulong ring = trace_block * params.num_positions + position;
-            ulong row = ring * 2ul + row_in_ring;
+            ulong row = ring * rows_per_ring + row_in_ring;
             hot = (uint)lanes[row * params.lane_stride + column];
             bool committed = hot != 0u;
             if (!committed && column < 64ul
@@ -1190,7 +1204,7 @@ kernel void akita_fp128_d512_subring64_decompose_fold(
                 committed = ((active_word >> (row & 63ul)) & 1ul) != 0ul;
             }
             valid = committed;
-            source_high = (uint)(row_in_ring * 32ul) + (hot >> 3u);
+            source_high = (uint)(row_in_ring * (params.onehot_k / 8ul)) + (hot >> 3u);
             challenge = (uint)(column * params.blocks_per_column + trace_block);
         }
 

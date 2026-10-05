@@ -49,6 +49,8 @@ fn packed_d128_decompose_fold_matches_model() {
             }
         }
         let params = PackedDecomposeFoldParams {
+            onehot_k: 256,
+            zero_suffix_start: num_rows as u64,
             num_rows: num_rows as u64,
             num_columns: COLUMNS as u64,
             lane_stride: COLUMNS as u64,
@@ -137,6 +139,8 @@ fn packed_d512_decompose_fold_matches_cpu() {
         }
     }
     let params = PackedDecomposeFoldParams {
+        onehot_k: 256,
+        zero_suffix_start: num_rows as u64,
         num_rows: num_rows as u64,
         num_columns: COLUMNS as u64,
         lane_stride: COLUMNS as u64,
@@ -228,6 +232,8 @@ fn packed_d512_subring64_decompose_fold_routes_match_cpu() {
         }
     }
     let params = PackedDecomposeFoldParams {
+        onehot_k: 256,
+        zero_suffix_start: num_rows as u64,
         num_rows: num_rows as u64,
         num_columns: COLUMNS as u64,
         lane_stride: COLUMNS as u64,

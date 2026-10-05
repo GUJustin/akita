@@ -81,7 +81,9 @@ impl MetalRuntime {
             } else {
                 (1u64 << params.num_columns) - 1
             };
-            if params.num_rows == 0
+            if !matches!((ring_d, params.onehot_k), (512, 16 | 256) | (128, 256))
+                || params.zero_suffix_start > params.num_rows
+                || params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.lane_stride
                 || (ring_d == 128 && dense && params.num_columns > 32)

@@ -387,9 +387,11 @@ pub(crate) struct PackedDecomposeFoldParams {
     pub(crate) challenge_weight: u64,
     pub(crate) output_coefficients: u64,
     pub(crate) zero_column_mask: u64,
+    pub(crate) onehot_k: u64,
+    pub(crate) zero_suffix_start: u64,
 }
 
-const _: [(); 72] = [(); size_of::<PackedDecomposeFoldParams>()];
+const _: [(); 88] = [(); size_of::<PackedDecomposeFoldParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

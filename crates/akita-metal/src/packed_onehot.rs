@@ -451,23 +451,23 @@ impl MetalBackend {
         })
     }
 
-    /// Decompose and challenge-fold one resident packed K256 source at D512
-    /// (rank-1 row) or D128 (rank-3 row).
+    /// Decompose and challenge-fold a resident K16/capacity64 source at D512,
+    /// or a K256/capacity32 source at D512 or D128.
     pub fn decompose_fold_packed_onehot<const D: usize>(
         &self,
         source: PackedOneHotCommitView<'_>,
         plan: DecomposeFoldPlan<'_>,
     ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
         let total_start = std::time::Instant::now();
-        if !matches!(D, 128 | 512)
-            || source.onehot_k() != 256
-            || source.column_capacity() != 32
-            || plan.num_positions_per_block == 0
+        if !matches!(
+            (D, source.onehot_k(), source.column_capacity()),
+            (128 | 512, 256, 32) | (512, 16, 64)
+        ) || plan.num_positions_per_block == 0
             || plan.num_digits == 0
             || !(source.num_rows() * source.onehot_k()).is_multiple_of(D)
         {
             return Err(MetalCommitError::UnsupportedShape(
-                "packed opening requires D512 or D128 over K256/capacity32 and nonempty output"
+                "packed opening requires K256/capacity32 at D128 or D512, or K16/capacity64 at D512, and nonempty output"
                     .into(),
             )
             .into_akita());
@@ -563,6 +563,8 @@ impl MetalBackend {
             .runtime()
             .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
         let params = PackedDecomposeFoldParams {
+            onehot_k: source.onehot_k() as u64,
+            zero_suffix_start: source.zero_suffix_start() as u64,
             num_rows: source.num_rows() as u64,
             num_columns: source.num_columns() as u64,
             lane_stride: source.num_columns() as u64,
@@ -640,7 +642,99 @@ impl MetalBackend {
 
 #[cfg(test)]
 mod tests {
+    use akita_challenges::SparseChallenge;
+    use akita_prover::compute::{OpeningFoldKernel, RootOpeningSource};
+    use akita_prover::CpuBackend;
+
     use super::*;
+
+    #[test]
+    fn k16_decompose_fold_matches_cpu_with_committed_zeros() {
+        const D: usize = 512;
+        const ROWS: usize = 4096;
+        const COLUMNS: usize = 59;
+        const CAPACITY: usize = 64;
+        const POSITIONS: usize = 32;
+        const LIVE_ROWS: usize = ROWS / 2 + 1;
+        const BLOCKS: usize = ROWS * 16 / D / POSITIONS;
+        let lanes = (0..ROWS * COLUMNS)
+            .map(|i| {
+                if i / COLUMNS < LIVE_ROWS {
+                    ((i * 7 + i / COLUMNS) % 16) as u8
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut active = vec![0u64; ROWS / 64];
+        for row in (0..LIVE_ROWS).step_by(2) {
+            active[row / 64] |= 1 << (row % 64);
+        }
+        let mask = 1 | (1 << 58);
+        let source = PackedOneHotCommitView::new_with_active_zero_rows(
+            16, CAPACITY, COLUMNS, &lanes, &active, mask,
+        )
+        .unwrap();
+        let indices = (0..CAPACITY)
+            .flat_map(|column| {
+                let lanes = &lanes;
+                (0..ROWS).map(move |row| {
+                    if column >= COLUMNS {
+                        return None;
+                    }
+                    let lane = lanes[row * COLUMNS + column];
+                    (lane != 0
+                        || (row < LIVE_ROWS && row % 2 == 0 && (column == 0 || column == 58)))
+                        .then_some(lane)
+                })
+            })
+            .collect();
+        let with_suffix = PackedOneHotCommitView::new_with_precomputed_metrics(
+            16,
+            CAPACITY,
+            COLUMNS,
+            &lanes,
+            &active,
+            mask,
+            source.hot_entries(),
+            LIVE_ROWS,
+        )
+        .unwrap();
+        let oracle = OneHotPoly::<F, u8>::new(16, indices).unwrap();
+        let view = <OneHotPoly<F, u8> as RootOpeningSource<F, D>>::opening_view(&oracle).unwrap();
+        let backend = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        for stride in [1, 8] {
+            let challenges = (0..CAPACITY * BLOCKS)
+                .map(|i| SparseChallenge {
+                    positions: (0..4)
+                        .map(|j| (((i * 13 + j * 17) % (D / stride)) * stride) as u32)
+                        .collect(),
+                    coeffs: [1, -2, 3, -4].into_iter().collect(),
+                })
+                .collect::<Vec<_>>();
+            for num_digits in [1, 3] {
+                let plan = DecomposeFoldPlan {
+                    challenges: &challenges,
+                    num_positions_per_block: POSITIONS,
+                    num_digits,
+                    log_basis: 3,
+                };
+                let expected = CpuBackend::DEFAULT
+                    .decompose_fold(None, view, plan)
+                    .unwrap();
+                for source in [source, with_suffix] {
+                    let actual = backend
+                        .decompose_fold_packed_onehot::<D>(source, plan)
+                        .unwrap();
+                    assert_eq!(
+                        actual.centered_coeffs_flat(),
+                        expected.centered_coeffs_flat()
+                    );
+                    assert_eq!(actual.z_folded_rings, expected.z_folded_rings);
+                }
+            }
+        }
+    }
 
     #[test]
     fn validates_borrowed_geometry_and_lanes() {
