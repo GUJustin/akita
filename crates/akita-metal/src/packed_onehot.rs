@@ -82,8 +82,17 @@ impl<'a> PackedOneHotCommitView<'a> {
         )
     }
 
-    /// Reuse producer-side counts and a certified all-zero row suffix.
-    pub fn new_k256_with_precomputed_metrics(
+    /// Reuse an exact producer-side entry count and a certified all-zero row suffix.
+    ///
+    /// The caller must include committed zeros in the count and certify that rows
+    /// at or beyond `zero_suffix_start` have no nonzero or committed-zero entries.
+    /// Selector bounds and structural geometry are still validated here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "borrowed packed selector geometry and producer metrics"
+    )]
+    pub fn new_with_precomputed_metrics(
+        onehot_k: usize,
         column_capacity: usize,
         num_columns: usize,
         lanes: &'a [u8],
@@ -93,7 +102,7 @@ impl<'a> PackedOneHotCommitView<'a> {
         zero_suffix_start: usize,
     ) -> Result<Self, AkitaError> {
         Self::new_inner(
-            256,
+            onehot_k,
             column_capacity,
             num_columns,
             lanes,
@@ -186,11 +195,21 @@ impl<'a> PackedOneHotCommitView<'a> {
             });
         }
         let hot_entries = if let Some(hot_entries) = precomputed_hot_entries {
-            if onehot_k != 256 || hot_entries > lanes.len() {
+            if hot_entries > lanes.len() {
                 return Err(AkitaError::InvalidInput(
-                    "precomputed packed entry counts require K256 and cannot exceed the lane count"
-                        .into(),
+                    "precomputed packed entry counts cannot exceed the lane count".into(),
                 ));
+            }
+            if onehot_k < 256
+                && lanes
+                    .iter()
+                    .copied()
+                    .max()
+                    .is_some_and(|lane| usize::from(lane) >= onehot_k)
+            {
+                return Err(AkitaError::InvalidInput(format!(
+                    "packed one-hot selector is outside K={onehot_k}"
+                )));
             }
             hot_entries
         } else {
@@ -636,6 +655,53 @@ mod tests {
     }
 
     #[test]
+    fn precomputed_metrics_validate_small_k_selectors() {
+        for k in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let lanes = [0, (k - 1) as u8, 0, 0];
+            let count = if k == 1 { 1 } else { 2 };
+            let view = PackedOneHotCommitView::new_with_precomputed_metrics(
+                k,
+                2,
+                2,
+                &lanes,
+                &[1],
+                1,
+                count,
+                1,
+            )
+            .unwrap();
+            assert_eq!(view.hot_entries(), count);
+            assert_eq!(view.zero_suffix_start(), 1);
+            assert!(view.commits_zero_at(0, 0));
+            if k < 256 {
+                let invalid = [0, k as u8, 0, 0];
+                assert!(PackedOneHotCommitView::new_with_precomputed_metrics(
+                    k,
+                    2,
+                    2,
+                    &invalid,
+                    &[1],
+                    1,
+                    count,
+                    1,
+                )
+                .is_err());
+            }
+            assert!(PackedOneHotCommitView::new_with_precomputed_metrics(
+                k,
+                2,
+                2,
+                &lanes,
+                &[1],
+                1,
+                5,
+                1,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn active_rows_distinguish_committed_zero_from_absence() {
         let lanes = vec![0, 0, 0, 7, 0, 0, 3, 0];
         let view =
@@ -661,7 +727,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(precomputed.hot_entries(), scanned.hot_entries());
-        let with_suffix = PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+        let with_suffix = PackedOneHotCommitView::new_with_precomputed_metrics(
+            256,
             4,
             2,
             &lanes,
@@ -672,7 +739,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(with_suffix.zero_suffix_start(), 3);
-        assert!(PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+        assert!(PackedOneHotCommitView::new_with_precomputed_metrics(
+            256,
             4,
             2,
             &lanes,

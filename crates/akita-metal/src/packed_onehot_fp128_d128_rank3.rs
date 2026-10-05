@@ -344,7 +344,8 @@ mod tests {
         let metal = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
         let source = match zero_suffix_start {
-            Some(zero_suffix_start) => PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+            Some(zero_suffix_start) => PackedOneHotCommitView::new_with_precomputed_metrics(
+                ONEHOT_K,
                 COLUMN_CAPACITY,
                 live_columns,
                 &lanes,

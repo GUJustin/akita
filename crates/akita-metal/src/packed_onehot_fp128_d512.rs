@@ -331,8 +331,9 @@ mod tests {
 
         let metal = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
-        let source = if let (256, Some(zero_suffix_start)) = (onehot_k, zero_suffix_start) {
-            PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+        let source = if let Some(zero_suffix_start) = zero_suffix_start {
+            PackedOneHotCommitView::new_with_precomputed_metrics(
+                onehot_k,
                 capacity,
                 LIVE_COLUMNS,
                 &lanes,
@@ -380,5 +381,10 @@ mod tests {
     #[test]
     fn parity_d512_k16_panels() {
         assert_panel_parity(16, 2048, 64, None);
+    }
+
+    #[test]
+    fn parity_d512_k16_panels_skip_zero_suffix() {
+        assert_panel_parity(16, 32768, 64, Some(16385));
     }
 }
