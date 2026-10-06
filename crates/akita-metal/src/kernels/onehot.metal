@@ -4369,32 +4369,6 @@ inline void akita_fp128_d512_accumulate_pair(
     }
 }
 
-inline void akita_fp128_d512_accumulate_shift(
-    thread AkitaTransposedFp128Accumulator &accumulator_0,
-    thread AkitaTransposedFp128Accumulator &accumulator_1,
-    threadgroup const uint *matrix,
-    uint simd_lane,
-    uint coefficient_band,
-    uint local_position,
-    uint local_shift)
-{
-    uint coefficient_base = coefficient_band * 256u;
-    uint4 coefficients_0 = uint4(
-        simd_lane + coefficient_base,
-        simd_lane + coefficient_base + 32u,
-        simd_lane + coefficient_base + 64u,
-        simd_lane + coefficient_base + 96u);
-    uint4 coefficients_1 = coefficients_0 + uint4(128u);
-    uint4 shift = uint4(local_shift);
-    uint matrix_base = local_position * 512u;
-    akita_fp128_d512_accumulate_mixed(
-        accumulator_0, matrix, matrix_base,
-        (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
-    akita_fp128_d512_accumulate_mixed(
-        accumulator_1, matrix, matrix_base,
-        (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
-}
-
 inline void akita_store_fp128_d512_group(
     device AkitaFp128 *partials,
     AkitaTransposedFp128Accumulator accumulator,
@@ -4421,6 +4395,203 @@ inline void akita_store_fp128_d512_group(
         akita_reduce_transposed_fp128(accumulator, 3u);
 }
 
+struct AkitaRadix26Accumulator {
+    int4 d0, d1, d2, d3, d4;
+};
+
+inline AkitaRadix26Accumulator akita_radix26_zero() {
+    AkitaRadix26Accumulator result;
+    result.d0 = result.d1 = result.d2 = result.d3 = result.d4 = int4(0);
+    return result;
+}
+
+// S=sum(d_i*2^(26i)) mod p. Normalize after at most sixteen signed inputs.
+// Propagated carries and the top quotient stay in [-17,17]; every i32
+// intermediate has magnitude <=17*(2^26+22537)<2^31. The top fold uses
+// 2^128 = AKITA_OFFSET = 64*2^26-22537 mod p. After folding, d0 lies in
+// [-17*22537,2^26-1+17*22537], d1 in [-17*64,2^26-1+17*64], the next two
+// digits in [0,2^26), and d4 in [0,2^24), restoring the induction invariant.
+inline void akita_radix26_normalize(thread AkitaRadix26Accumulator &accumulator) {
+    constexpr int mask = (1 << 26) - 1;
+    int4 carry = accumulator.d0 >> 26;
+    accumulator.d0 &= int4(mask);
+    accumulator.d1 += carry;
+    carry = accumulator.d1 >> 26;
+    accumulator.d1 &= int4(mask);
+    accumulator.d2 += carry;
+    carry = accumulator.d2 >> 26;
+    accumulator.d2 &= int4(mask);
+    accumulator.d3 += carry;
+    carry = accumulator.d3 >> 26;
+    accumulator.d3 &= int4(mask);
+    accumulator.d4 += carry;
+    int4 high = accumulator.d4 >> 24;
+    accumulator.d4 &= int4((1 << 24) - 1);
+    constexpr int correction_low = int((1ul << 32ul) - ulong(AKITA_OFFSET));
+    accumulator.d0 -= high * int4(correction_low);
+    accumulator.d1 += high * int4(64);
+}
+
+inline int4 akita_radix26_gather(
+    threadgroup const uint *matrix, uint digit, uint tile_elements, uint matrix_base, uint4 sources)
+{
+    uint base = digit * tile_elements + matrix_base;
+    return int4(matrix[base + sources[0]], matrix[base + sources[1]],
+        matrix[base + sources[2]], matrix[base + sources[3]]);
+}
+
+inline void akita_radix26_accumulate(
+    thread AkitaRadix26Accumulator &accumulator,
+    threadgroup const uint *matrix,
+    uint tile_elements,
+    uint matrix_base,
+    uint4 sources,
+    bool4 positive)
+{
+    int4 sign = select(int4(-1), int4(1), positive);
+    accumulator.d0 += sign * akita_radix26_gather(matrix, 0u, tile_elements, matrix_base, sources);
+    accumulator.d1 += sign * akita_radix26_gather(matrix, 1u, tile_elements, matrix_base, sources);
+    accumulator.d2 += sign * akita_radix26_gather(matrix, 2u, tile_elements, matrix_base, sources);
+    accumulator.d3 += sign * akita_radix26_gather(matrix, 3u, tile_elements, matrix_base, sources);
+    accumulator.d4 += sign * akita_radix26_gather(matrix, 4u, tile_elements, matrix_base, sources);
+}
+
+inline AkitaFp128 akita_reduce_radix26(AkitaRadix26Accumulator accumulator, uint component) {
+    constexpr int mask = (1 << 26) - 1;
+    int d0 = accumulator.d0[component];
+    int d1 = accumulator.d1[component] + (d0 >> 26);
+    d0 &= mask;
+    int d2 = accumulator.d2[component] + (d1 >> 26);
+    d1 &= mask;
+    int d3 = accumulator.d3[component] + (d2 >> 26);
+    d2 &= mask;
+    int d4 = accumulator.d4[component] + (d3 >> 26);
+    d3 &= mask;
+    uint w0 = uint(d0) | (uint(d1) << 26u);
+    uint w1 = (uint(d1) >> 6u) | (uint(d2) << 20u);
+    uint w2 = (uint(d2) >> 12u) | (uint(d3) << 14u);
+    uint w3 = (uint(d3) >> 18u) | (uint(d4) << 8u);
+    AkitaWideAccumulator digits;
+    digits.low_digits = int4(w0 & 65535u, w1 & 65535u, w2 & 65535u, w3 & 65535u);
+    // Retain the signed quotient above bit128 for the canonical field reducer.
+    digits.high_digits = int4(w0 >> 16u, w1 >> 16u, w2 >> 16u, d4 >> 8);
+    return akita_reduce_wide(digits);
+}
+
+// K16 puts 32 selectors in each D512 position. Accumulate independent radix-26
+// digits and normalize after each half-position (at most 16 signed inputs),
+// using the same bounded accumulator and canonical reducer as D128/rank-3.
+// Two positions occupy 5 * 1024 words in the existing 8192-word shared buffer.
+inline void akita_fp128_d512_commit_k16_radix26(
+    device const AkitaFp128 *matrix,
+    device const uchar *lanes,
+    device AkitaFp128 *partials,
+    constant PackedOneHotCommitParams &params,
+    device const ulong *active_zero_rows,
+    threadgroup uint *shared_matrix,
+    uint thread_index,
+    uint3 threadgroup_index)
+{
+    constexpr uint tasks_per_stream = 32u;
+    constexpr uint threads_per_threadgroup = 1024u;
+    constexpr uint tile_elements = 1024u;
+    uint live_columns = (uint)params.num_columns;
+    uint num_tasks = (uint)params.dispatch_tasks;
+    uint streams = (num_tasks + tasks_per_stream - 1u) / tasks_per_stream;
+    uint simd_lane = thread_index & 31u;
+    uint simdgroup = thread_index >> 5u;
+    uint position_partials = (uint)params.position_partials_per_block;
+    uint groups_per_band = streams * position_partials * (uint)params.n_a;
+    uint coefficient_band = threadgroup_index.x / groups_per_band;
+    uint group = threadgroup_index.x % groups_per_band;
+    uint stream = group % streams;
+    uint partial_group = group / streams;
+    uint position_partial = partial_group % position_partials;
+    uint a_row = partial_group / position_partials;
+    uint positions_per_partial = (uint)params.positions_per_partial;
+    uint partial_start = position_partial * positions_per_partial;
+    uint rows_per_partial = positions_per_partial * 32u;
+    uint rows_per_block = (uint)params.positions_per_block * 32u;
+    uint dispatch_task = stream * tasks_per_stream + simdgroup;
+    bool task_active = dispatch_task < num_tasks;
+    uint global_task = (uint)params.task_offset + dispatch_task;
+    uint task_block = global_task / live_columns;
+    uint task_column = global_task % live_columns;
+    ulong matrix_cursor =
+        ((ulong)a_row * params.positions_per_block + (ulong)partial_start) * 512ul;
+
+    AkitaRadix26Accumulator accumulator_0 = akita_radix26_zero();
+    AkitaRadix26Accumulator accumulator_1 = akita_radix26_zero();
+    uint4 coefficients_0 = uint4(simd_lane, simd_lane + 32u, simd_lane + 64u,
+        simd_lane + 96u) + coefficient_band * 256u;
+    uint4 coefficients_1 = coefficients_0 + 128u;
+    for (uint tile = 0u; tile < positions_per_partial / 2u; ++tile) {
+        for (uint index = thread_index; index < tile_elements;
+             index += threads_per_threadgroup) {
+            AkitaFp128 value = matrix[matrix_cursor + index];
+            constexpr uint mask = (1u << 26u) - 1u;
+            shared_matrix[index] = value.limb[0] & mask;
+            shared_matrix[tile_elements + index] =
+                ((value.limb[0] >> 26u) | (value.limb[1] << 6u)) & mask;
+            shared_matrix[tile_elements * 2u + index] =
+                ((value.limb[1] >> 20u) | (value.limb[2] << 12u)) & mask;
+            shared_matrix[tile_elements * 3u + index] =
+                ((value.limb[2] >> 14u) | (value.limb[3] << 18u)) & mask;
+            shared_matrix[tile_elements * 4u + index] = value.limb[3] >> 8u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint position = 0u; position < 2u; ++position) {
+            ulong trace_row = (ulong)task_block * rows_per_block
+                + (ulong)position_partial * rows_per_partial
+                + (ulong)tile * 64ul + position * 32u + simd_lane;
+            uint local_hot = 0u;
+            bool local_selected = false;
+            if (task_active) {
+                local_hot = lanes[(trace_row - params.lane_row_offset)
+                    * params.lane_stride + task_column];
+                local_selected = local_hot != 0u;
+                if (!local_selected
+                    && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
+                    local_selected =
+                        ((active_zero_rows[trace_row >> 6ul] >> (trace_row & 63ul))
+                            & 1ul) != 0ul;
+                }
+            }
+            uint selected = uint(simd_ballot(local_selected).operator unsigned long());
+            for (uint lane_half = 0u; lane_half < 2u; ++lane_half) {
+                uint remaining = selected & (0xffffu << (lane_half * 16u));
+                while (remaining != 0u) {
+                    uint selected_lane = ctz(remaining);
+                    uint selected_hot = simd_shuffle(local_hot, selected_lane);
+                    uint4 shift = uint4(selected_lane * 16u + selected_hot);
+                    akita_radix26_accumulate(
+                        accumulator_0, shared_matrix, tile_elements, position * 512u,
+                        (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+                    akita_radix26_accumulate(
+                        accumulator_1, shared_matrix, tile_elements, position * 512u,
+                        (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
+                    remaining &= remaining - 1u;
+                }
+                akita_radix26_normalize(accumulator_0);
+                akita_radix26_normalize(accumulator_1);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        matrix_cursor += tile_elements;
+    }
+    if (task_active) {
+        ulong block = (ulong)task_column * params.blocks_per_column + task_block;
+        ulong base = (ulong)position_partial * params.output_coefficients
+            + (block * params.n_a + a_row) * 512ul;
+        for (uint component = 0u; component < 4u; ++component) {
+            partials[base + coefficients_0[component]] =
+                akita_reduce_radix26(accumulator_0, component);
+            partials[base + coefficients_1[component]] =
+                akita_reduce_radix26(accumulator_1, component);
+        }
+    }
+}
+
 kernel void akita_packed_onehot_commit_fp128_d512_panels(
     device const AkitaFp128 *matrix [[buffer(0)]],
     device const uchar *lanes [[buffer(1)]],
@@ -4431,12 +4602,19 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     uint3 threadgroup_index [[threadgroup_position_in_grid]])
 {
     threadgroup uint shared_matrix[PACKED_FP128_D512_PANEL_TILE_ELEMENTS * 4];
+    if (params.onehot_k == 16ul) {
+        akita_fp128_d512_commit_k16_radix26(
+            matrix, lanes, partials, params, active_zero_rows, shared_matrix,
+            thread_index, threadgroup_index);
+        return;
+    }
+
 
     constexpr uint tasks_per_stream = 32u;
     constexpr uint threads_per_threadgroup = 1024u;
     constexpr uint positions_per_tile = 4u;
     uint live_columns = (uint)params.num_columns;
-    uint onehot_k = (uint)params.onehot_k;
+    constexpr uint onehot_k = 256u;
     uint rows_per_position = 512u / onehot_k;
     uint rows_per_tile = positions_per_tile * rows_per_position;
     uint num_tasks = (uint)params.dispatch_tasks;
@@ -4486,71 +4664,34 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (onehot_k == 256u) {
-            uint local_hot = 0u;
-            bool local_selected = false;
-            if (simdgroup_active && simd_lane < rows_per_tile) {
-                ulong trace_row = (ulong)task_block * (ulong)rows_per_block
-                    + (ulong)position_partial * (ulong)rows_per_partial
-                    + (ulong)tile * (ulong)rows_per_tile
-                    + (ulong)simd_lane;
-                local_hot = (uint)lanes[
-                    (trace_row - params.lane_row_offset) * params.lane_stride
-                        + (ulong)task_column];
-                local_selected = local_hot != 0u;
-                if (!local_selected
-                    && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
-                    ulong active_word = active_zero_rows[trace_row >> 6ul];
-                    local_selected = ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
-                }
+        uint local_hot = 0u;
+        bool local_selected = false;
+        if (simdgroup_active && simd_lane < rows_per_tile) {
+            ulong trace_row = (ulong)task_block * (ulong)rows_per_block
+                + (ulong)position_partial * (ulong)rows_per_partial
+                + (ulong)tile * (ulong)rows_per_tile
+                + (ulong)simd_lane;
+            local_hot = (uint)lanes[
+                (trace_row - params.lane_row_offset) * params.lane_stride
+                    + (ulong)task_column];
+            local_selected = local_hot != 0u;
+            if (!local_selected
+                && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
+                ulong active_word = active_zero_rows[trace_row >> 6ul];
+                local_selected = ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
             }
-            uint selected = uint(
-                simd_ballot(local_selected).operator unsigned long());
-            while (selected != 0u) {
-                uint selected_lane = ctz(selected);
-                uint selected_hot = simd_shuffle(local_hot, selected_lane);
-                uint local_position = selected_lane >> 1u;
-                bool odd_row = (selected_lane & 1u) != 0u;
-                akita_fp128_d512_accumulate_pair(
-                    accumulator_0, accumulator_1, shared_matrix, simd_lane,
-                    coefficient_band, local_position, selected_hot, odd_row);
-                selected &= selected - 1u;
-            }
-        } else {
-            for (uint local_position = 0u;
-                 local_position < positions_per_tile;
-                 ++local_position) {
-                ulong trace_row = (ulong)task_block * (ulong)rows_per_block
-                    + (ulong)position_partial * (ulong)rows_per_partial
-                    + (ulong)tile * (ulong)rows_per_tile
-                    + (ulong)local_position * (ulong)rows_per_position
-                    + (ulong)simd_lane;
-                uint local_hot = 0u;
-                bool local_selected = false;
-                if (simdgroup_active) {
-                    local_hot = (uint)lanes[
-                        (trace_row - params.lane_row_offset) * params.lane_stride
-                            + (ulong)task_column];
-                    local_selected = local_hot != 0u;
-                    if (!local_selected
-                        && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
-                        ulong active_word = active_zero_rows[trace_row >> 6ul];
-                        local_selected =
-                            ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
-                    }
-                }
-                uint selected = uint(
-                    simd_ballot(local_selected).operator unsigned long());
-                while (selected != 0u) {
-                    uint selected_lane = ctz(selected);
-                    uint selected_hot = simd_shuffle(local_hot, selected_lane);
-                    uint local_shift = selected_lane * onehot_k + selected_hot;
-                    akita_fp128_d512_accumulate_shift(
-                        accumulator_0, accumulator_1, shared_matrix, simd_lane,
-                        coefficient_band, local_position, local_shift);
-                    selected &= selected - 1u;
-                }
-            }
+        }
+        uint selected = uint(
+            simd_ballot(local_selected).operator unsigned long());
+        while (selected != 0u) {
+            uint selected_lane = ctz(selected);
+            uint selected_hot = simd_shuffle(local_hot, selected_lane);
+            uint local_position = selected_lane >> 1u;
+            bool odd_row = (selected_lane & 1u) != 0u;
+            akita_fp128_d512_accumulate_pair(
+                accumulator_0, accumulator_1, shared_matrix, simd_lane,
+                coefficient_band, local_position, selected_hot, odd_row);
+            selected &= selected - 1u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         matrix_cursor += (ulong)PACKED_FP128_D512_PANEL_TILE_ELEMENTS;
@@ -4748,88 +4889,6 @@ static_assert(17ul * ((1ul << 32ul) - ulong(AKITA_OFFSET)) < (1ul << 26ul),
 static_assert(17ul * ((1ul << 26ul) + (1ul << 32ul) - ulong(AKITA_OFFSET))
     < (1ul << 31ul), "radix26 signed intermediates fit i32");
 
-struct AkitaRadix26Accumulator {
-    int4 d0, d1, d2, d3, d4;
-};
-
-inline AkitaRadix26Accumulator akita_radix26_zero() {
-    AkitaRadix26Accumulator result;
-    result.d0 = result.d1 = result.d2 = result.d3 = result.d4 = int4(0);
-    return result;
-}
-
-// S=sum(d_i*2^(26i)) mod p. Four tiles add at most sixteen signed inputs.
-// Propagated carries and the top quotient stay in [-17,17]; every i32
-// intermediate has magnitude <=17*(2^26+22537)<2^31. The top fold uses
-// 2^128 = AKITA_OFFSET = 64*2^26-22537 mod p. After folding, d0 lies in
-// [-17*22537,2^26-1+17*22537], d1 in [-17*64,2^26-1+17*64], the next two
-// digits in [0,2^26), and d4 in [0,2^24), restoring the induction invariant.
-inline void akita_radix26_normalize(thread AkitaRadix26Accumulator &accumulator) {
-    constexpr int mask = (1 << 26) - 1;
-    int4 carry = accumulator.d0 >> 26;
-    accumulator.d0 &= int4(mask);
-    accumulator.d1 += carry;
-    carry = accumulator.d1 >> 26;
-    accumulator.d1 &= int4(mask);
-    accumulator.d2 += carry;
-    carry = accumulator.d2 >> 26;
-    accumulator.d2 &= int4(mask);
-    accumulator.d3 += carry;
-    carry = accumulator.d3 >> 26;
-    accumulator.d3 &= int4(mask);
-    accumulator.d4 += carry;
-    int4 high = accumulator.d4 >> 24;
-    accumulator.d4 &= int4((1 << 24) - 1);
-    constexpr int correction_low = int((1ul << 32ul) - ulong(AKITA_OFFSET));
-    accumulator.d0 -= high * int4(correction_low);
-    accumulator.d1 += high * int4(64);
-}
-
-inline int4 akita_radix26_gather(
-    threadgroup const uint *matrix, uint digit, uint matrix_base, uint4 sources)
-{
-    uint base = digit * PACKED_FP128_D128_RANK3_TILE_ELEMENTS + matrix_base;
-    return int4(matrix[base + sources[0]], matrix[base + sources[1]],
-        matrix[base + sources[2]], matrix[base + sources[3]]);
-}
-
-inline void akita_radix26_accumulate(
-    thread AkitaRadix26Accumulator &accumulator,
-    threadgroup const uint *matrix,
-    uint matrix_base,
-    uint4 sources,
-    bool4 positive)
-{
-    int4 sign = select(int4(-1), int4(1), positive);
-    accumulator.d0 += sign * akita_radix26_gather(matrix, 0u, matrix_base, sources);
-    accumulator.d1 += sign * akita_radix26_gather(matrix, 1u, matrix_base, sources);
-    accumulator.d2 += sign * akita_radix26_gather(matrix, 2u, matrix_base, sources);
-    accumulator.d3 += sign * akita_radix26_gather(matrix, 3u, matrix_base, sources);
-    accumulator.d4 += sign * akita_radix26_gather(matrix, 4u, matrix_base, sources);
-}
-
-inline AkitaFp128 akita_reduce_radix26(AkitaRadix26Accumulator accumulator, uint component) {
-    constexpr int mask = (1 << 26) - 1;
-    int d0 = accumulator.d0[component];
-    int d1 = accumulator.d1[component] + (d0 >> 26);
-    d0 &= mask;
-    int d2 = accumulator.d2[component] + (d1 >> 26);
-    d1 &= mask;
-    int d3 = accumulator.d3[component] + (d2 >> 26);
-    d2 &= mask;
-    int d4 = accumulator.d4[component] + (d3 >> 26);
-    d3 &= mask;
-    uint w0 = uint(d0) | (uint(d1) << 26u);
-    uint w1 = (uint(d1) >> 6u) | (uint(d2) << 20u);
-    uint w2 = (uint(d2) >> 12u) | (uint(d3) << 14u);
-    uint w3 = (uint(d3) >> 18u) | (uint(d4) << 8u);
-    AkitaWideAccumulator digits;
-    digits.low_digits = int4(w0 & 65535u, w1 & 65535u, w2 & 65535u, w3 & 65535u);
-    // Retain the signed quotient above bit128 for the canonical field reducer.
-    digits.high_digits = int4(w0 >> 16u, w1 >> 16u, w2 >> 16u, d4 >> 8);
-    return akita_reduce_wide(digits);
-}
-
 inline void akita_fp128_d128_rank3_accumulate_task_tile(
     thread AkitaRadix26Accumulator &accumulator,
     threadgroup const uint *shared_matrix,
@@ -4861,7 +4920,8 @@ inline void akita_fp128_d128_rank3_accumulate_task_tile(
         uint local_position = 2u * selected_lane + (selected_hot >> 7u);
         uint4 shift = uint4(selected_hot & 127u);
         akita_radix26_accumulate(
-            accumulator, shared_matrix, local_position * PACKED_FP128_D128_RANK3_D,
+            accumulator, shared_matrix, PACKED_FP128_D128_RANK3_TILE_ELEMENTS,
+            local_position * PACKED_FP128_D128_RANK3_D,
             (coefficients - shift) & uint4(127u), coefficients >= shift);
         selected &= selected - 1u;
     }

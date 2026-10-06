@@ -265,6 +265,7 @@ mod tests {
         rows: usize,
         capacity: usize,
         zero_suffix_start: Option<usize>,
+        dense: bool,
     ) {
         const LIVE_COLUMNS: usize = 5;
         const POSITIONS_PER_BLOCK: usize = 64;
@@ -273,7 +274,7 @@ mod tests {
         let lanes = (0..rows * LIVE_COLUMNS)
             .map(|index| {
                 let row = index / LIVE_COLUMNS;
-                if row < zero_suffix_start.unwrap_or(rows) && index.is_multiple_of(97) {
+                if row < zero_suffix_start.unwrap_or(rows) && (dense || index.is_multiple_of(97)) {
                     ((index.wrapping_mul(73) % (onehot_k - 1)) + 1) as u8
                 } else {
                     0
@@ -370,21 +371,27 @@ mod tests {
 
     #[test]
     fn parity_d512_k256_panels() {
-        assert_panel_parity(256, 4096, 32, None);
+        assert_panel_parity(256, 4096, 32, None, false);
     }
 
     #[test]
     fn parity_d512_k256_panels_skip_zero_suffix() {
-        assert_panel_parity(256, 4096, 32, Some(2048));
+        assert_panel_parity(256, 4096, 32, Some(2048), false);
     }
 
     #[test]
     fn parity_d512_k16_panels() {
-        assert_panel_parity(16, 2048, 64, None);
+        assert_panel_parity(16, 2048, 64, None, false);
+    }
+
+    #[test]
+    fn parity_d512_k16_dense_panels() {
+        // Every SIMD lane contributes, exercising both 16-input carry windows.
+        assert_panel_parity(16, 32768, 64, None, true);
     }
 
     #[test]
     fn parity_d512_k16_panels_skip_zero_suffix() {
-        assert_panel_parity(16, 32768, 64, Some(16385));
+        assert_panel_parity(16, 32768, 64, Some(16385), false);
     }
 }
