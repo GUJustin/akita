@@ -105,14 +105,19 @@ kernel void akita_onehot_limb_commit(
         metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         for (uint i = 0; i < 16; i++) {
             uint idx = tid + i * 256, coeff = idx % 512;
-            ulong sum = 0;
+            uint lo = 0, hi = 0;
             for (uint r = 0; r < DOT_BATCH; r++) if (first + r < end) {
-                sum += ulong(key[first_key + KeyIndex(r) * key_stride + idx]) * work[r * 512 + coeff];
+                uint a = key[first_key + KeyIndex(r) * key_stride + idx];
+                uint b = work[r * 512 + coeff];
+                uint next_lo = lo + a * b;
+                hi += metal::mulhi(a, b) + uint(next_lo < lo);
+                lo = next_lo;
             }
             // At most eight canonical products with p < 2^30. The sum plus
             // its Montgomery correction fits u64; the quotient is below 3p.
-            uint correction = uint(sum) * (0u - uint(p.prime.pinv));
-            uint v = uint((sum + ulong(correction) * modulus) >> 32);
+            // The correction's low word is -lo, so the carry is exactly lo!=0.
+            uint correction = lo * (0u - uint(p.prime.pinv));
+            uint v = hi + metal::mulhi(correction, modulus) + uint(lo != 0);
             // v can exceed i32::MAX before the two reductions.
             v = metal::select(v, v - modulus, v >= modulus);
             v = metal::select(v, v - modulus, v >= modulus);
