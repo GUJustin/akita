@@ -176,7 +176,7 @@ fn retained_coefficient_packing_matches_cpu_onehot() {
             .collect::<Vec<_>>();
         // Both packing and no-packing limits, with nontrivial near-modulus
         // field values. Tile1024 and block boundaries occur within the prefix.
-        for subring in [64, 512] {
+        for subring in [128, 512] {
             let geometry = SubringCoefficientPackingGeometry::try_new(1, D, subring).unwrap();
             let prepared = PreparedSubringCoefficientPackingPoint::new(
                 geometry,
