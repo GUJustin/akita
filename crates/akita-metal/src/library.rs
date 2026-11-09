@@ -38,12 +38,19 @@ impl AkitaMetal {
                 "akita/onehot_fold.metal",
                 include_str!("../shaders/akita/onehot_fold.metal"),
             ),
+            (
+                "akita/onehot_packing.metal",
+                include_str!("../shaders/akita/onehot_packing.metal"),
+            ),
         ] {
             spec = spec.source(name, source);
         }
         spec = spec.kernel(crate::onehot_fold::FOLD);
         let mut instantiations = String::new();
-        for instance in crate::onehot_ntt::instances() {
+        for instance in crate::onehot_ntt::instances()
+            .into_iter()
+            .chain(crate::onehot_packing::instances())
+        {
             let _ = writeln!(instantiations,
                 "template [[host_name(\"{host}\")]] [[kernel]] decltype(akita::{template}<{args}>) akita::{template}<{args}>;",
                 host = instance.host_name, template = instance.template, args = instance.args);

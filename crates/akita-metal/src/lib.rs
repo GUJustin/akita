@@ -13,6 +13,7 @@ mod library;
 pub mod onehot;
 pub mod onehot_fold;
 pub mod onehot_ntt;
+pub mod onehot_packing;
 
 pub use error::AkitaMetalError;
 pub use jolt_metal::{ErrorClass, MetalError};

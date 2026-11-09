@@ -120,3 +120,121 @@ fn windowed_root_fold_matches_negacyclic_monomials() {
         assert_eq!(output, expected);
     }
 }
+
+/// Reuse the canonical CPU OneHotBatchView oracle. It accumulates the tensor
+/// product of the position/packing weights per nonzero, independently of the
+/// GPU's coefficient tiles and two-pass reduction.
+#[test]
+fn retained_coefficient_packing_matches_cpu_onehot() {
+    use akita_cpu_backend::custom_source::{
+        OneHotBatchView, RootOpeningSource, SubringCoefficientPackingBatchKernel,
+        SubringCoefficientPackingPlan,
+    };
+    use akita_cpu_backend::{AkitaProverSetup, CpuBackend, OneHotPoly};
+    use akita_metal::onehot_packing::{OneHotPackingShape, OneHotPackingWorkspace};
+    use akita_params::{BasisMode, SetupMatrixCapacity, SubringCoefficientPackingGeometry};
+    use akita_types::{PreparedSubringCoefficientPackingPoint, SubringCoefficientPackingTables};
+
+    const D: usize = 512;
+    const P: usize = 2048;
+    const B: usize = 4;
+    const C: usize = 3;
+    const ROWS: usize = P * B * 32;
+    let metal = AkitaMetal::new().expect("Metal shaders");
+    let setup = AkitaProverSetup::<F>::generate_with_capacity(
+        1,
+        1,
+        SetupMatrixCapacity {
+            num_field_elements: 1,
+        },
+    )
+    .expect("minimal CPU setup");
+    let backend = CpuBackend::<F, F>::new(setup.expanded).expect("CPU backend");
+    for prefix in [P * 32 + 1025 * 32 + 7, 0] {
+        let mut selectors = vec![0; prefix * C];
+        let mut masks = vec![0; prefix];
+        let mut indices = vec![vec![None; ROWS]; C];
+        for row in 0..prefix {
+            selectors[row * C] = (row % 16) as u8;
+            masks[row] = 1; // Distinguish committed zero from an absent zero.
+            selectors[row * C + 1] = if row % 5 == 0 { 0 } else { 15 };
+            for column in 0..C {
+                let hot = selectors[row * C + column];
+                if hot != 0 || (masks[row] >> column) & 1 != 0 {
+                    indices[column][row] = Some(hot);
+                }
+            }
+        }
+        let polys = indices
+            .into_iter()
+            .map(|indices| OneHotPoly::<F, u8>::new(16, indices).unwrap())
+            .collect::<Vec<_>>();
+        let refs = polys.iter().collect::<Vec<_>>();
+        let source_vars = (ROWS * 16).trailing_zeros() as usize;
+        let point = (0..source_vars)
+            .map(|index| -F::from_u64((index + 2) as u64))
+            .collect::<Vec<_>>();
+        // Both packing and no-packing limits, with nontrivial near-modulus
+        // field values. Tile1024 and block boundaries occur within the prefix.
+        for subring in [64, 512] {
+            let geometry = SubringCoefficientPackingGeometry::try_new(1, D, subring).unwrap();
+            let prepared = PreparedSubringCoefficientPackingPoint::new(
+                geometry,
+                BasisMode::Lagrange,
+                P * B,
+                P,
+                source_vars,
+                &point,
+            )
+            .unwrap();
+            let tables = SubringCoefficientPackingTables::new(prepared).unwrap();
+            let expected = <CpuBackend<F, F> as SubringCoefficientPackingBatchKernel<
+                OneHotBatchView<'_, F, D, u8>,
+                F,
+                F,
+                D,
+            >>::coefficient_packing_partials_batch(
+                &backend,
+                None,
+                <OneHotPoly<F, u8> as RootOpeningSource<F, D>>::opening_batch(&refs).unwrap(),
+                SubringCoefficientPackingPlan { tables: &tables },
+            )
+            .unwrap();
+            let shape = OneHotPackingShape {
+                num_positions: P,
+                blocks_per_column: B,
+                num_columns: C,
+                subring_dimension: subring,
+            };
+            let mut workspace = OneHotPackingWorkspace::new(
+                &metal,
+                shape,
+                tables.position_weights(),
+                tables.packing_weights(),
+            )
+            .unwrap();
+            for (first, blocks) in [(0, 2), (2, 1)] {
+                let start = (first * P * 32).min(prefix);
+                let end = ((first + blocks) * P * 32).min(prefix);
+                let sources = DeviceK16Sources::from_row_major(
+                    &metal,
+                    selectors[start * C..end * C].to_vec(),
+                    &masks[start..end],
+                    C,
+                    blocks * P * 32,
+                )
+                .unwrap();
+                workspace.accumulate(&sources, first).unwrap();
+                assert!(workspace.accumulate(&sources, first).is_err());
+                // The operation only borrows sources; the same owner remains
+                // usable by the already independently checked root fold.
+            }
+            let got = workspace.read().unwrap();
+            let expected = expected
+                .iter()
+                .flat_map(|column| column.coordinates().iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(got, expected, "subring={subring}, prefix={prefix}");
+        }
+    }
+}
