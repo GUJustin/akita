@@ -3,7 +3,7 @@
 
 use akita_algebra::CyclotomicRing;
 use akita_metal::onehot::DeviceK16Sources;
-use akita_metal::onehot_fold::{OneHotFoldShape, OneHotFoldWorkspace};
+use akita_metal::onehot_fold::{OneHotFoldChallenge, OneHotFoldShape, OneHotFoldWorkspace};
 use akita_metal::AkitaMetal;
 use jolt_field::{Prime128OffsetA7F7 as F, Ring, Zero};
 
@@ -20,23 +20,36 @@ fn windowed_root_fold_matches_negacyclic_monomials() {
         num_columns: C,
     };
     let ranges = [0..2, 2..3, 3..4, 4..4];
-    let mut challenges = vec![0i8; C * B * 64];
-    for (index, value) in challenges.iter_mut().enumerate() {
-        *value = match index % 13 {
-            0 => -128,
-            1 => 127,
-            4 => -3,
-            7 => 2,
-            _ => 0,
-        };
-    }
+    let challenge_terms: Vec<(Vec<u32>, Vec<i8>)> = (0..C * B)
+        .map(|index| {
+            let positions = (0..41)
+                .map(|term| ((term * 83 + index * 17) % D) as u32)
+                .collect();
+            let coeffs = (0..41)
+                .map(|term| match term % 4 {
+                    0 => -128,
+                    1 => 127,
+                    2 => -3,
+                    _ => 2,
+                })
+                .collect();
+            (positions, coeffs)
+        })
+        .collect();
+    let challenges: Vec<_> = challenge_terms
+        .iter()
+        .map(|(positions, coefficients)| OneHotFoldChallenge {
+            positions,
+            coefficients,
+        })
+        .collect();
     let challenge_rings: Vec<_> = challenges
-        .chunks_exact(64)
+        .iter()
         .map(|challenge| {
             let mut coefficients = [F::zero(); D];
-            for (position, &value) in challenge.iter().enumerate() {
+            for (&position, &value) in challenge.positions.iter().zip(challenge.coefficients) {
                 let absolute = F::from_u64(u64::from(value.unsigned_abs()));
-                coefficients[8 * position] = if value < 0 { -absolute } else { absolute };
+                coefficients[position as usize] = if value < 0 { -absolute } else { absolute };
             }
             CyclotomicRing::<F, D>::from_slice(&coefficients)
         })

@@ -94,6 +94,12 @@ impl DeviceK16Sources {
             .zip(masks.chunks(32))
             .zip(ring_kinds.chunks_mut(columns))
             .try_for_each(encode)?;
+        tracing::info!(
+            uniform_rings = ring_kinds.iter().filter(|&&kind| kind < 16).count(),
+            mixed_rings = ring_kinds.iter().filter(|&&kind| kind == 254).count(),
+            absent_rings = ring_kinds.iter().filter(|&&kind| kind == 255).count(),
+            "Metal one-hot ring classes"
+        );
         let sources = (0..columns)
             .map(|column| SourceLayout {
                 hot_offset: column,

@@ -1,4 +1,4 @@
-//! Integer root folding of K16/D512 sources by subring-64 challenges.
+//! Integer root folding of K16/D512 sources by sparse ring challenges.
 
 use std::{ops::Range, time::Duration};
 
@@ -9,7 +9,15 @@ use jolt_metal::runtime::{Batch, Binding, DeviceBuffer, Grid};
 use crate::onehot::{to_u32, to_u64, DeviceK16Sources};
 use crate::{AkitaMetal, AkitaMetalError};
 
-pub(crate) const FOLD: &str = "akita_k16_subring64_fold";
+/// Borrowed terms of a degree-512 challenge polynomial. Repeated positions
+/// add their coefficients; sampler-family validation stays with the caller.
+#[derive(Clone, Copy, Debug)]
+pub struct OneHotFoldChallenge<'a> {
+    pub positions: &'a [u32],
+    pub coefficients: &'a [i8],
+}
+
+pub(crate) const FOLD: &str = "akita_k16_sparse_fold";
 const D: usize = 512;
 const THREADS: usize = 256;
 
@@ -33,14 +41,22 @@ struct FoldParams {
     padding: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SparseTerm {
+    position: u16,
+    coefficient: i16,
+}
+
 /// Owns one compressed integer output, reused across consecutive trace windows.
-/// Challenges are dense 64-entry signed vectors in column/block order, embedded
-/// at multiples of eight in the degree-512 ring. Output is position/chunk/coeff.
+/// Challenges are sparse degree-512 rings in column/block order, without an
+/// embedding restriction. Output is position/chunk/coefficient.
 pub struct OneHotFoldWorkspace<'a> {
     metal: &'a AkitaMetal,
     shape: OneHotFoldShape,
     ranges: Vec<Range<usize>>,
-    challenges: DeviceBuffer<i8>,
+    terms: DeviceBuffer<SparseTerm>,
+    offsets: DeviceBuffer<u32>,
     output: DeviceBuffer<i32>,
     next_block: usize,
 }
@@ -49,7 +65,7 @@ impl<'a> OneHotFoldWorkspace<'a> {
     pub fn new(
         metal: &'a AkitaMetal,
         shape: OneHotFoldShape,
-        dense_challenges: &[i8],
+        challenges: &[OneHotFoldChallenge<'_>],
         chunk_ranges: &[Range<usize>],
     ) -> Result<Self, AkitaMetalError> {
         let OneHotFoldShape {
@@ -63,12 +79,37 @@ impl<'a> OneHotFoldWorkspace<'a> {
             || blocks_per_column == 0
             || !(1..=64).contains(&num_columns)
             || count >= 1 << 26
-            || checked::product([count, 64]) != Some(dense_challenges.len())
+            || count != challenges.len()
             || chunk_ranges.is_empty()
         {
             return Err(AkitaMetalError::Shape(
-                "invalid subring fold geometry".into(),
+                "invalid sparse fold geometry".into(),
             ));
+        }
+        let mut terms = Vec::new();
+        let mut offsets = Vec::with_capacity(challenges.len().saturating_add(1));
+        offsets.push(0);
+        for challenge in challenges {
+            if challenge.positions.len() != challenge.coefficients.len()
+                || challenge
+                    .positions
+                    .iter()
+                    .any(|&position| position >= D as u32)
+            {
+                return Err(AkitaMetalError::Shape(
+                    "invalid sparse challenge terms".into(),
+                ));
+            }
+            for (&position, &coefficient) in challenge.positions.iter().zip(challenge.coefficients)
+            {
+                terms.push(SparseTerm {
+                    position: u16::try_from(position).map_err(|_| {
+                        AkitaMetalError::Shape("challenge index exceeds u16".into())
+                    })?,
+                    coefficient: i16::from(coefficient),
+                });
+            }
+            offsets.push(to_u32(terms.len())?);
         }
         let mut end = 0;
         for range in chunk_ranges {
@@ -80,15 +121,15 @@ impl<'a> OneHotFoldWorkspace<'a> {
             end = range.end;
             // Each challenge coefficient can contribute at most once to a
             // fixed output coefficient: one-hot row exponents are distinct.
-            let bound = dense_challenges
-                .chunks_exact(64)
+            let bound = challenges
+                .iter()
                 .enumerate()
                 .filter(|(index, _)| {
                     index
                         .checked_rem(blocks_per_column)
                         .is_some_and(|block| range.contains(&block))
                 })
-                .flat_map(|(_, challenge)| challenge)
+                .flat_map(|(_, challenge)| challenge.coefficients)
                 .try_fold(0u32, |sum, value| {
                     sum.checked_add(u32::from(value.unsigned_abs()))
                 });
@@ -121,7 +162,8 @@ impl<'a> OneHotFoldWorkspace<'a> {
             metal,
             shape,
             ranges: chunk_ranges.to_vec(),
-            challenges: DeviceBuffer::from_slice(metal.device(), dense_challenges)?,
+            terms: DeviceBuffer::from_slice(metal.device(), &terms)?,
+            offsets: DeviceBuffer::from_slice(metal.device(), &offsets)?,
             output: DeviceBuffer::zeroed(metal.device(), len)?,
             next_block: 0,
         })
@@ -191,10 +233,11 @@ impl<'a> OneHotFoldWorkspace<'a> {
                 self.metal.pipeline(FOLD)?,
                 &[
                     Binding::buffer(&sources.hot),
-                    Binding::buffer(&self.challenges),
+                    Binding::buffer(&self.terms),
                     Binding::buffer(&self.output),
                     Binding::value(&params),
                     Binding::buffer(&device_ranges),
+                    Binding::buffer(&self.offsets),
                 ],
                 Grid::linear(grid, THREADS),
             )?;
