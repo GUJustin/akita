@@ -12,27 +12,6 @@ struct OneHotLimbParams {
     uint first_chunk, parts, direct_output;
 };
 
-template <uint MODULUS>
-kernel void akita_onehot_limb_sum_key(
-    device const uint* key [[buffer(0)]],
-    device uint* sums [[buffer(1)]],
-    constant OneHotLimbParams& p [[buffer(2)]],
-    uint i [[thread_position_in_grid]]) {
-    uint spans = (p.positions - 1) / p.reconstruction_positions + 1;
-    ulong count = ulong(p.rows) * spans * 4096;
-    if (i >= count) return;
-    uint ring = i / 4096, coeff = i % 4096;
-    uint row = ring / spans, span = ring % spans;
-    uint begin = span * p.reconstruction_positions;
-    uint end = metal::min(p.positions, begin + p.reconstruction_positions);
-    uint sum = 0;
-    for (uint pos = begin; pos < end; pos++) {
-        sum += key[(ulong(row) * p.columns + ulong(pos) * p.digits) * 4096 + coeff];
-        sum = metal::select(sum, sum - MODULUS, sum >= MODULUS);
-    }
-    sums[i] = sum;
-}
-
 template <uint C, uint DOT_BATCH, uint MODULUS, typename KeyIndex>
 kernel void akita_onehot_limb_commit(
     device const uchar* hot [[buffer(0)]],
@@ -43,7 +22,6 @@ kernel void akita_onehot_limb_commit(
     device jolt::Fp128<C>* out [[buffer(5)]],
     constant OneHotLimbParams& p [[buffer(6)]],
     device const uchar* ring_kinds [[buffer(7)]],
-    device const uint* summed_key [[buffer(8)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     static_assert(DOT_BATCH > 0 && DOT_BATCH <= 8, "dot products fit u64 and the shared tile");
@@ -84,36 +62,8 @@ kernel void akita_onehot_limb_commit(
     device const uint* untwistq = untwist + 512;
     device const uint* uniform_spectra = untwistq + 512;
     threadgroup uint work[4096];
-    if (tid == 0) {
-        uint kind = 255;
-        for (uint pos = begin; pos < end; pos++) {
-            uint current = block_chunks + ulong(pos) * 32 < live_chunks ?
-                ring_kinds[source.hot_offset + (ulong(block) * p.positions + pos) * source.hot_stride] : 255u;
-            if (pos == begin) kind = current;
-            else if (kind != current) kind = 254;
-            if (kind == 254) break;
-        }
-        work[4095] = kind;
-    }
-    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    uint span_kind = work[4095];
-    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    if (span_kind == 255) {
-        for (uint coeff = tid; coeff < 512; coeff += 256)
-            if (!p.direct_output || p.first_chunk == 0)
-                out[ulong(group) * 512 + coeff] = F::zero();
-        return;
-    }
     uint acc[16] = {};
-    if (span_kind < 16) {
-        uint spans = (p.positions - 1) / p.reconstruction_positions + 1;
-        ulong offset = (ulong(row_a) * spans + p.first_chunk + part) * 4096;
-        for (uint i = 0; i < 16; i++) {
-            uint idx = tid + i * 256;
-            acc[i] = uint(normalize(prime, mont_mul(prime,
-                int(summed_key[offset + idx]), int(uniform_spectra[span_kind * 512 + idx % 512]))));
-        }
-    } else for (uint first = begin; first < end; first += DOT_BATCH) {
+    for (uint first = begin; first < end; first += DOT_BATCH) {
         KeyIndex first_key = key_row + KeyIndex(first) * key_stride;
         if (tid < DOT_BATCH * 32) {
             uint r = tid / 32, c = tid % 32, pos = first + r;
