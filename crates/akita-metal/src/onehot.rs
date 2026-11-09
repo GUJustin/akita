@@ -17,6 +17,8 @@ pub(crate) struct SourceLayout {
 /// Each column keeps the full logical domain even when its suffix is omitted.
 pub struct DeviceK16Sources {
     pub(crate) hot: DeviceBuffer<u8>,
+    /// Per ring and column: 0..15 uniform, 254 mixed, 255 absent.
+    pub(crate) ring_kinds: DeviceBuffer<u8>,
     pub(crate) sources: Vec<SourceLayout>,
 }
 
@@ -46,13 +48,33 @@ impl DeviceK16Sources {
         }
         let fields = checked::product([logical_rows, 16])
             .ok_or_else(|| shape_error("one-hot logical domain overflows"))?;
-        let encode = |(row, &mask): (&mut [u8], &u64)| {
-            for (column, selector) in row.iter_mut().enumerate() {
-                if *selector >= 16 {
-                    return Err(shape_error("a K16 selector is outside 0..16"));
+        let ring_len = checked::product([masks.len().div_ceil(32), columns])
+            .ok_or_else(|| shape_error("ring classification size overflows"))?;
+        let row_tile = checked::product([32, columns])
+            .ok_or_else(|| shape_error("selector tile size overflows"))?;
+        let mut ring_kinds = vec![255; ring_len];
+        let encode = |((tile, masks), kinds): ((&mut [u8], &[u64]), &mut [u8])| {
+            for (row, (selectors, &mask)) in tile.chunks_exact_mut(columns).zip(masks).enumerate() {
+                for (column, (selector, kind)) in
+                    selectors.iter_mut().zip(kinds.iter_mut()).enumerate()
+                {
+                    if *selector >= 16 {
+                        return Err(shape_error("a K16 selector is outside 0..16"));
+                    }
+                    if *selector == 0 && mask & (1u64 << column) == 0 {
+                        *selector = 255;
+                    }
+                    if row == 0 {
+                        *kind = *selector;
+                    } else if *kind != *selector {
+                        *kind = 254;
+                    }
                 }
-                if *selector == 0 && mask & (1u64 << column) == 0 {
-                    *selector = 255;
+            }
+            // An omitted row is absent, not another copy of a live selector.
+            if masks.len() < 32 {
+                for kind in kinds.iter_mut().filter(|kind| **kind < 16) {
+                    *kind = 254;
                 }
             }
             Ok(())
@@ -61,14 +83,16 @@ impl DeviceK16Sources {
         {
             use rayon::prelude::*;
             selected_rows
-                .par_chunks_mut(columns)
-                .zip(masks)
+                .par_chunks_mut(row_tile)
+                .zip(masks.par_chunks(32))
+                .zip(ring_kinds.par_chunks_mut(columns))
                 .try_for_each(encode)?;
         }
         #[cfg(not(feature = "parallel"))]
         selected_rows
-            .chunks_mut(columns)
-            .zip(masks)
+            .chunks_mut(row_tile)
+            .zip(masks.chunks(32))
+            .zip(ring_kinds.chunks_mut(columns))
             .try_for_each(encode)?;
         let sources = (0..columns)
             .map(|column| SourceLayout {
@@ -80,6 +104,7 @@ impl DeviceK16Sources {
             .collect();
         Ok(Self {
             hot: DeviceBuffer::from_slice(metal.device(), &selected_rows)?,
+            ring_kinds: DeviceBuffer::from_slice(metal.device(), &ring_kinds)?,
             sources,
         })
     }

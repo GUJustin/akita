@@ -273,6 +273,7 @@ impl<'a> OneHotNttWorkspace<'a> {
                         Binding::buffer(&source_map),
                         Binding::buffer(target),
                         Binding::value(params),
+                        Binding::buffer(&sources.ring_kinds),
                     ],
                     Grid::linear(grid, THREADS),
                 )?;

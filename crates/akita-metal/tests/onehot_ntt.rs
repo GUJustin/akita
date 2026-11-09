@@ -40,7 +40,7 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
             // The larger case is sparse so the independent ring oracle stays
             // cheap while crossing both 252-position and block boundaries.
             if positions == 4 || [0, 1, 251 * 32, 252 * 32, 511 * 32, prefix - 1].contains(&row) {
-                selectors[row * COLUMNS] = (row % 16) as u8;
+                selectors[row * COLUMNS] = if row < 32 { 0 } else { (row % 16) as u8 };
                 masks[row] = 1; // column zero commits digit zero too
                 selectors[row * COLUMNS + 1] = 15;
                 // Column two remains wholly absent despite zero selectors.

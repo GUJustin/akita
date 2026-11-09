@@ -130,7 +130,7 @@ fn transform_tables(prime: NttPrime<i32>, twiddles: &NttTwiddles<i32, D>) -> Vec
             modulus - value
         }
     });
-    let mut tables = Vec::with_capacity(16 * ROWS * ROWS + 16 + D + 2 * D);
+    let mut tables = Vec::with_capacity(16 * ROWS * ROWS + 16 + D + 2 * D + 16 * D);
     for digit in 0..16 {
         for row in 0..ROWS {
             for frequency in 0..ROWS {
@@ -153,6 +153,18 @@ fn transform_tables(prime: NttPrime<i32>, twiddles: &NttTwiddles<i32, D>) -> Vec
                 .iter()
                 .map(|&value| ((u64::from(value) << 32) / u64::from(modulus)) as u32),
         );
+    }
+    // A uniform ring has the same selected digit in every K16 row. Source
+    // spectra are canonical residues in natural frequency order, whereas
+    // the prepared key retains Montgomery residues for the dot product.
+    let plan = NttKernelPlan::detect::<i32>();
+    for digit in 0..16 {
+        let mut values = std::array::from_fn(|i| prime.from_canonical(i32::from(i % 16 == digit)));
+        forward_ntt(&mut values, prime, twiddles, plan);
+        for frequency in 0..D {
+            let reversed = frequency.reverse_bits() >> (usize::BITS - D.ilog2());
+            tables.push(prime.to_canonical(values[reversed]) as u32);
+        }
     }
     tables
 }

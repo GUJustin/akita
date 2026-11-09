@@ -21,6 +21,7 @@ kernel void akita_onehot_limb_commit(
     device const uint* source_for_ring [[buffer(4)]],
     device jolt::Fp128<C>* out [[buffer(5)]],
     constant OneHotLimbParams& p [[buffer(6)]],
+    device const uchar* ring_kinds [[buffer(7)]],
     uint group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
     static_assert(DOT_BATCH > 0 && DOT_BATCH <= 8, "dot products fit u64 and the shared tile");
@@ -59,6 +60,7 @@ kernel void akita_onehot_limb_commit(
     device const uint* invwq = invw + 256;
     device const uint* untwist = invwq + 256;
     device const uint* untwistq = untwist + 512;
+    device const uint* uniform_spectra = untwistq + 512;
     threadgroup uint work[4096];
     uint acc[16] = {};
     for (uint first = begin; first < end; first += DOT_BATCH) {
@@ -69,27 +71,34 @@ kernel void akita_onehot_limb_commit(
             if (pos < end) {
                 ulong chunk = block_chunks + ulong(pos) * 32;
                 uint present = chunk < live_chunks ? uint(metal::min(32ul, live_chunks - chunk)) : 0u;
-                for (uint row = 0; row < present; row++) {
-                    uint v = hot[source_base + (ulong(pos) * 32 + row) * source.hot_stride];
-                    if (v != 255u) {
-                        uint i = r * 512 + v * 32 + c;
-                        work[i] = uint(csubp(prime, int(work[i] + tables[(v * 32 + row) * 32 + c])));
-                    }
-                }
-                uint a[16];
-                for (uint v = 0; v < 16; v++) a[v] = work[r * 512 + v * 32 + c];
-                for (uint half_len = 8; half_len >= 1; half_len /= 2)
-                    for (uint start = 0; start < 16; start += 2 * half_len)
-                        for (uint j = 0; j < half_len; j++) {
-                            uint x = a[start + j], y = a[start + j + half_len];
-                            a[start + j] = uint(csubp(prime, int(x + y)));
-                            uint diff = uint(caddp(prime, int(x) - int(y)));
-                            a[start + j + half_len] = j == 0 ? diff :
-                                shoup_mul_canonical(diff, tw[j * (8 / half_len)], twq[j * (8 / half_len)], modulus);
+                uint kind = present == 0 ? 255u : ring_kinds[
+                    source.hot_offset + (ulong(block) * p.positions + pos) * source.hot_stride];
+                if (kind < 16u) {
+                    for (uint v = 0; v < 16; v++)
+                        work[r * 512 + v * 32 + c] = uniform_spectra[kind * 512 + v * 32 + c];
+                } else if (kind != 255u) {
+                    for (uint row = 0; row < present; row++) {
+                        uint v = hot[source_base + (ulong(pos) * 32 + row) * source.hot_stride];
+                        if (v != 255u) {
+                            uint i = r * 512 + v * 32 + c;
+                            work[i] = uint(csubp(prime, int(work[i] + tables[(v * 32 + row) * 32 + c])));
                         }
-                for (uint v = 0; v < 16; v++) {
-                    uint rev = ((v & 1) << 3) | ((v & 2) << 1) | ((v & 4) >> 1) | ((v & 8) >> 3);
-                    work[r * 512 + rev * 32 + c] = a[v];
+                    }
+                    uint a[16];
+                    for (uint v = 0; v < 16; v++) a[v] = work[r * 512 + v * 32 + c];
+                    for (uint half_len = 8; half_len >= 1; half_len /= 2)
+                        for (uint start = 0; start < 16; start += 2 * half_len)
+                            for (uint j = 0; j < half_len; j++) {
+                                uint x = a[start + j], y = a[start + j + half_len];
+                                a[start + j] = uint(csubp(prime, int(x + y)));
+                                uint diff = uint(caddp(prime, int(x) - int(y)));
+                                a[start + j + half_len] = j == 0 ? diff :
+                                    shoup_mul_canonical(diff, tw[j * (8 / half_len)], twq[j * (8 / half_len)], modulus);
+                            }
+                    for (uint v = 0; v < 16; v++) {
+                        uint rev = ((v & 1) << 3) | ((v & 2) << 1) | ((v & 4) >> 1) | ((v & 8) >> 3);
+                        work[r * 512 + rev * 32 + c] = a[v];
+                    }
                 }
             }
         }
