@@ -31,16 +31,15 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
                 }
             })
             .collect();
-        let device_key = DeviceOneHotNttKey::new(&metal, &key).expect("key");
+        let mut device_key = DeviceOneHotNttKey::new(&metal, &key).expect("key");
         let logical_rows = positions * 32 * 2;
         let prefix = positions * 32 + 7;
         let mut selectors = vec![0; prefix * COLUMNS];
         let mut masks = vec![0; prefix];
         for row in 0..prefix {
-            // The larger case is sparse so the independent ring oracle stays
-            // cheap while crossing both 252-position and block boundaries.
-            if positions == 4 || [0, 1, 251 * 32, 252 * 32, 511 * 32, prefix - 1].contains(&row) {
-                selectors[row * COLUMNS] = if row < 32 { 0 } else { (row % 16) as u8 };
+            let uniform = row < 252 * 32 || (504 * 32..512 * 32).contains(&row);
+            if positions == 4 || uniform || [252 * 32, prefix - 1].contains(&row) {
+                selectors[row * COLUMNS] = if uniform { 0 } else { (row % 16) as u8 };
                 masks[row] = 1; // column zero commits digit zero too
                 selectors[row * COLUMNS + 1] = 15;
                 // Column two remains wholly absent despite zero selectors.
@@ -70,7 +69,7 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
                 .expect("row-major source");
         for _ in 0..2 {
             let (out, _) = workspace
-                .commit(&device_key, &source, shape)
+                .commit(&mut device_key, &source, shape)
                 .expect("commit");
             assert_eq!(out.read().expect("read output"), expected.as_slice());
         }
@@ -78,7 +77,7 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
             DeviceK16Sources::from_row_major(&metal, Vec::new(), &[], COLUMNS, logical_rows)
                 .expect("implicit zero suffix");
         let (out, _) = workspace
-            .commit(&device_key, &empty, shape)
+            .commit(&mut device_key, &empty, shape)
             .expect("zero commit");
         assert!(out.read().expect("zero output").iter().all(Zero::is_zero));
     }

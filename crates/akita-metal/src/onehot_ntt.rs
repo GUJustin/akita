@@ -25,6 +25,7 @@ use key::D;
 const COMMIT: &str = "akita_onehot_limb_commit_fp128";
 const COMMIT_COMPACT: &str = "akita_onehot_limb_commit_compact_fp128";
 const COMBINE: &str = "akita_onehot_limb_combine_fp128";
+const SUM_KEY: &str = "akita_onehot_limb_sum_key";
 const THREADS: usize = D / 2;
 const TARGET_GROUPS: usize = 4096;
 const MAX_BATCH_PARTS: usize = 16;
@@ -48,6 +49,11 @@ pub(crate) fn instances() -> Vec<Instance> {
             template: "akita_onehot_limb_combine",
             args: format!("{}u", F::C),
             host_name: COMBINE.into(),
+        }))
+        .chain(Q128_RAW_PRIMES.first().map(|prime| Instance {
+            template: "akita_onehot_limb_sum_key",
+            args: format!("{prime}u"),
+            host_name: SUM_KEY.into(),
         }))
         .collect()
 }
@@ -127,7 +133,7 @@ impl<'a> OneHotNttWorkspace<'a> {
     )]
     pub fn commit(
         &mut self,
-        matrix: &DeviceOneHotNttKey,
+        matrix: &mut DeviceOneHotNttKey,
         sources: &DeviceK16Sources,
         shape: OneHotCommitShape,
     ) -> Result<(&mut DeviceBuffer<F>, Duration), AkitaMetalError> {
@@ -253,6 +259,12 @@ impl<'a> OneHotNttWorkspace<'a> {
         if rings == 0 {
             return Ok((out, Duration::ZERO));
         }
+        let preparation = matrix.prepare_sums(self.metal, shape, params)?;
+        let summed = &matrix
+            .summed
+            .as_ref()
+            .ok_or_else(|| AkitaMetalError::Shape("summed key unavailable".into()))?
+            .1;
         let target = self.partials.as_ref().unwrap_or(out);
         let mut batch = Batch::new(device)?;
         for params in &windows {
@@ -274,6 +286,7 @@ impl<'a> OneHotNttWorkspace<'a> {
                         Binding::buffer(target),
                         Binding::value(params),
                         Binding::buffer(&sources.ring_kinds),
+                        Binding::buffer(summed),
                     ],
                     Grid::linear(grid, THREADS),
                 )?;
@@ -295,6 +308,52 @@ impl<'a> OneHotNttWorkspace<'a> {
             }
         }
         let time = batch.commit_and_wait()?;
-        Ok((out, time))
+        Ok((out, preparation + time))
+    }
+}
+
+impl DeviceOneHotNttKey {
+    fn prepare_sums(
+        &mut self,
+        metal: &AkitaMetal,
+        shape: OneHotCommitShape,
+        params: CommitParams,
+    ) -> Result<Duration, AkitaMetalError> {
+        if self
+            .summed
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == shape)
+        {
+            return Ok(Duration::ZERO);
+        }
+        let spans = checked::div_ceil(params.positions as usize, self.reconstruction_positions)
+            .ok_or_else(|| AkitaMetalError::Shape("invalid summed-key span".into()))?;
+        let len = checked::product([shape.n_a, spans, D, key::LIMBS])
+            .ok_or_else(|| AkitaMetalError::Shape("summed key size overflows".into()))?;
+        to_u32(len)?;
+        let pipeline = metal.pipeline(SUM_KEY)?;
+        if pipeline.max_total_threads_per_threadgroup() < THREADS {
+            return Err(AkitaMetalError::Shape(
+                "the key-sum kernel needs 256 threads per group".into(),
+            ));
+        }
+        let sums = DeviceBuffer::<u32>::zeroed(metal.device(), len)?;
+        let mut batch = Batch::new(metal.device())?;
+        // SAFETY: commit validated the matrix view; each output word sums its
+        // own clipped span using 64-bit indices into the resident key.
+        unsafe {
+            batch.dispatch_unchecked(
+                pipeline,
+                &[
+                    Binding::buffer(&self.transformed),
+                    Binding::buffer(&sums),
+                    Binding::value(&params),
+                ],
+                Grid::linear(len, THREADS),
+            )?;
+        }
+        let time = batch.commit_and_wait()?;
+        self.summed = Some((shape, sums));
+        Ok(time)
     }
 }

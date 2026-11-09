@@ -8,6 +8,7 @@ use akita_error::checked;
 use jolt_field::Prime128OffsetA7F7;
 use jolt_metal::runtime::DeviceBuffer;
 
+use crate::onehot::OneHotCommitShape;
 use crate::{AkitaMetal, AkitaMetalError};
 
 pub(super) const D: usize = 512;
@@ -20,12 +21,15 @@ pub(super) const ROWS: usize = D / 16;
 /// Preparation depends only on the supplied key. A commitment may view any
 /// validated prefix and matrix geometry, independently of its trace length.
 /// The transformed key uses twice the coefficient storage of the field key.
+/// Commitments cache span sums for the most recent matrix view; changing that
+/// view replaces only the sums, leaving the transformed key intact.
 pub struct DeviceOneHotNttKey {
     pub(super) coefficient_count: usize,
     pub(super) transformed: DeviceBuffer<u32>,
     pub(super) tables: DeviceBuffer<u32>,
     pub(super) prime: NttPrime<i32>,
     pub(super) reconstruction_positions: usize,
+    pub(super) summed: Option<(OneHotCommitShape, DeviceBuffer<u32>)>,
 }
 
 impl DeviceOneHotNttKey {
@@ -110,6 +114,7 @@ impl DeviceOneHotNttKey {
             tables: DeviceBuffer::from_slice(metal.device(), &tables)?,
             prime,
             reconstruction_positions,
+            summed: None,
         })
     }
 }
