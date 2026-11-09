@@ -12,14 +12,14 @@ pub(crate) struct Instance {
     pub(crate) host_name: String,
 }
 
-/// An explicitly owned device and its precompiled commitment pipelines.
+/// An explicitly owned device and its precompiled trace pipelines.
 pub struct AkitaMetal {
     device: Device,
     library: ShaderLibrary,
 }
 
 impl AkitaMetal {
-    /// Compiles all supported kernels before any commitment runs.
+    /// Compiles all supported kernels before any trace operation runs.
     pub fn new() -> Result<Self, AkitaMetalError> {
         let device = Device::system_default()?;
         let mut spec = FIELD_HEADERS
@@ -34,9 +34,14 @@ impl AkitaMetal {
                 "akita/onehot_ntt.metal",
                 include_str!("../shaders/akita/onehot_ntt.metal"),
             ),
+            (
+                "akita/onehot_fold.metal",
+                include_str!("../shaders/akita/onehot_fold.metal"),
+            ),
         ] {
             spec = spec.source(name, source);
         }
+        spec = spec.kernel(crate::onehot_fold::FOLD);
         let mut instantiations = String::new();
         for instance in crate::onehot_ntt::instances() {
             let _ = writeln!(instantiations,

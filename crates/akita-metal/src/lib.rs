@@ -1,4 +1,4 @@
-//! Prover-only K16/D512 commitment kernels, using the shared `jolt-metal`
+//! Prover-only K16/D512 trace kernels, using the shared `jolt-metal`
 //! runtime and field arithmetic. Unsupported shapes fail before dispatch.
 
 #![deny(
@@ -11,6 +11,7 @@
 mod error;
 mod library;
 pub mod onehot;
+pub mod onehot_fold;
 pub mod onehot_ntt;
 
 pub use error::AkitaMetalError;
