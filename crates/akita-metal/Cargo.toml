@@ -1,0 +1,27 @@
+[package]
+name = "akita-metal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0 OR MIT"
+description = "Prover-only Metal commitment kernels for Akita"
+repository = "https://github.com/LayerZero-Labs/akita"
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+akita-algebra = { version = "0.1.0", path = "../akita-algebra" }
+akita-error = { version = "0.1.0", path = "../akita-error" }
+bytemuck = { version = "1.16", features = ["derive"] }
+jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "1976ced1bb8777af51c706c9c2fee15b3de5a10a", default-features = false, features = [
+  "bytemuck",
+  "solinas",
+] }
+jolt-metal = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "1976ced1bb8777af51c706c9c2fee15b3de5a10a" }
+rayon = { version = "1.10", optional = true }
+thiserror = "2.0"
+
+[lints]
+workspace = true

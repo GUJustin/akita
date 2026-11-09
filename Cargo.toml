@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/akita-metal",
   "crates/akita-algebra",
   "crates/akita-challenges",
   "crates/akita-config",
