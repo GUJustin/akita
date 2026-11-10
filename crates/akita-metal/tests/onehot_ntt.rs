@@ -96,11 +96,17 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
                 .commit(&device_key, &source, shape)
                 .expect("commit");
             assert_eq!(out.read().expect("read output"), expected.as_slice());
+            let shared_result = shared
+                .try_commit(&device_key, &source, shape)
+                .expect("shared-key admission and execution");
             if rank == 1 && digits == 1 {
-                let (out, _) = shared
-                    .commit(&device_key, &source, shape)
-                    .expect("shared-key commit");
+                let (out, _) = shared_result.expect("supported shared-key commit");
                 assert_eq!(out.read().expect("shared-key output"), expected.as_slice());
+            } else {
+                assert!(
+                    shared_result.is_none(),
+                    "valid unsupported geometry must decline"
+                );
             }
         }
         let empty =
@@ -112,8 +118,9 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
         assert!(out.read().expect("zero output").iter().all(Zero::is_zero));
         if rank == 1 && digits == 1 {
             let (out, _) = shared
-                .commit(&device_key, &empty, shape)
-                .expect("shared-key empty reuse");
+                .try_commit(&device_key, &empty, shape)
+                .expect("shared-key empty reuse")
+                .expect("supported shared-key empty reuse");
             assert!(out
                 .read()
                 .expect("shared-key zero output")

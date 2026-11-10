@@ -76,22 +76,22 @@ impl<'a> SharedKeyNttWorkspace<'a> {
     }
 
     /// Commits in the existing source/block/A-row/coefficient order.
-    /// Unsupported geometry or resource limits fail before GPU execution.
+    /// Returns `None` before GPU execution when valid geometry, reflected
+    /// pipeline limits, or the bounded workspace do not support this path.
+    /// Invalid inputs and allocation or execution errors remain errors.
     #[expect(
         clippy::arithmetic_side_effects,
         reason = "checked geometry and allocation extents bound dispatch products and batch differences"
     )]
-    pub fn commit(
+    pub fn try_commit(
         &mut self,
         matrix: &DeviceOneHotNttKey,
         sources: &DeviceK16Sources,
         shape: OneHotCommitShape,
-    ) -> Result<(&mut DeviceBuffer<F>, Duration), AkitaMetalError> {
+    ) -> Result<Option<(&mut DeviceBuffer<F>, Duration)>, AkitaMetalError> {
         let layout = CommitLayout::new(matrix, sources, shape)?;
         if layout.geometry.rows != 1 || layout.geometry.digits != 1 {
-            return Err(AkitaMetalError::Shape(
-                "shared-key NTT requires rank one and one inner digit".into(),
-            ));
+            return Ok(None);
         }
         if I32_LAZY_DOT_BATCH != 6 {
             return Err(AkitaMetalError::Shape(
@@ -114,9 +114,7 @@ impl<'a> SharedKeyNttWorkspace<'a> {
                 || pipeline.static_threadgroup_memory_length()
                     > device.limits().max_threadgroup_memory_length
             {
-                return Err(AkitaMetalError::Shape(
-                    "shared-key NTT pipeline exceeds device thread or shared-memory limits".into(),
-                ));
+                return Ok(None);
             }
         }
         let spectrum_per_part =
@@ -140,9 +138,9 @@ impl<'a> SharedKeyNttWorkspace<'a> {
         .into_iter()
         .try_fold(0usize, |sum, value| checked::sum([sum, value?]))
         .ok_or_else(|| AkitaMetalError::Shape("workspace metadata extent overflows".into()))?;
-        let available = WORKSPACE_BYTES
-            .checked_sub(fixed_bytes)
-            .ok_or_else(|| AkitaMetalError::Shape("workspace metadata exceeds budget".into()))?;
+        let Some(available) = WORKSPACE_BYTES.checked_sub(fixed_bytes) else {
+            return Ok(None);
+        };
         let parts = if layout.rings == 0 {
             1
         } else {
@@ -153,9 +151,7 @@ impl<'a> SharedKeyNttWorkspace<'a> {
                 .min(layout.chunks)
         };
         if parts == 0 {
-            return Err(AkitaMetalError::Shape(
-                "one source spectrum span exceeds workspace budget".into(),
-            ));
+            return Ok(None);
         }
         let spectrum_len = checked::product([parts, spectrum_per_part])
             .ok_or_else(|| AkitaMetalError::Shape("source workspace extent overflows".into()))?;
@@ -224,7 +220,7 @@ impl<'a> SharedKeyNttWorkspace<'a> {
             .as_mut()
             .ok_or_else(|| AkitaMetalError::Shape("shared-key workspace unavailable".into()))?;
         if layout.rings == 0 {
-            return Ok((&mut buffers.out, Duration::ZERO));
+            return Ok(Some((&mut buffers.out, Duration::ZERO)));
         }
         let layouts = DeviceBuffer::from_slice(device, &layout.layouts)?;
         let source_map = DeviceBuffer::from_slice(device, &layout.source_map)?;
@@ -288,6 +284,6 @@ impl<'a> SharedKeyNttWorkspace<'a> {
             }
         }
         let elapsed = batch.commit_and_wait()?;
-        Ok((&mut buffers.out, elapsed))
+        Ok(Some((&mut buffers.out, elapsed)))
     }
 }
