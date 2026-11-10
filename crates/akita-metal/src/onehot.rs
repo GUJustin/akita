@@ -271,8 +271,7 @@ impl DeviceK16Sources {
         // successful encoder writes every byte in its slices, including the
         // final partial ring. All workers have joined; failures returned before
         // this point. Empty buffers require no writes. No GPU work has run.
-        let hot = unsafe { hot.assume_init()? };
-        let ring_kinds = unsafe { ring_kinds.assume_init()? };
+        let (hot, ring_kinds) = unsafe { (hot.assume_init()?, ring_kinds.assume_init()?) };
         let sources = (0..columns)
             .map(|column| SourceLayout {
                 hot_offset: column,
