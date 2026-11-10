@@ -5,7 +5,9 @@
 //! bounded batches avoid retaining one output per reconstruction chunk.
 
 mod key;
+mod shared;
 pub use key::DeviceOneHotNttKey;
+pub use shared::SharedKeyNttWorkspace;
 
 use std::time::Duration;
 
@@ -49,6 +51,7 @@ pub(crate) fn instances() -> Vec<Instance> {
             args: format!("{}u", F::C),
             host_name: COMBINE.into(),
         }))
+        .chain(shared::instances())
         .collect()
 }
 
@@ -131,41 +134,15 @@ impl<'a> OneHotNttWorkspace<'a> {
         sources: &DeviceK16Sources,
         shape: OneHotCommitShape,
     ) -> Result<(&mut DeviceBuffer<F>, Duration), AkitaMetalError> {
-        let geometry = Geometry::new(shape)?;
-        let matrix_len = checked::product([geometry.rows, geometry.columns, D])
-            .ok_or_else(|| AkitaMetalError::Shape("A matrix size overflows usize".into()))?;
-        if matrix_len > matrix.coefficient_count {
-            return Err(AkitaMetalError::Shape(format!(
-                "the A matrix view needs {matrix_len} coefficients; the key has {}",
-                matrix.coefficient_count
-            )));
-        }
-        let mut layouts = Vec::with_capacity(sources.sources.len());
-        let mut counts = Vec::with_capacity(sources.sources.len());
-        let mut rings = 0usize;
-        for source in &sources.sources {
-            let count = checked::product([geometry.blocks::<D>(source)?, geometry.rows])
-                .ok_or_else(|| {
-                    AkitaMetalError::Shape("source output size overflows usize".into())
-                })?;
-            layouts.push(SourceParams {
-                fields: to_u64(source.fields)?,
-                chunks: to_u64(source.chunks)?,
-                hot_offset: to_u64(source.hot_offset)?,
-                first_ring: to_u32(rings)?,
-                hot_stride: to_u32(source.hot_stride)?,
-            });
-            rings = checked::sum([rings, count]).ok_or_else(|| {
-                AkitaMetalError::Shape("output ring count overflows usize".into())
-            })?;
-            counts.push(count);
-        }
-        let len = checked::product([rings, D])
-            .ok_or_else(|| AkitaMetalError::Shape("output size overflows usize".into()))?;
-        checked::product([len, size_of::<F>()])
-            .ok_or_else(|| AkitaMetalError::Shape("output bytes overflow usize".into()))?;
-        let chunks = checked::div_ceil(geometry.positions, matrix.reconstruction_positions)
-            .ok_or_else(|| AkitaMetalError::Shape("invalid reconstruction bound".into()))?;
+        let CommitLayout {
+            geometry,
+            matrix_len,
+            layouts,
+            source_map,
+            rings,
+            len,
+            chunks,
+        } = CommitLayout::new(matrix, sources, shape)?;
         let parts = checked::div_ceil(TARGET_GROUPS, rings)
             .unwrap_or(1)
             .clamp(1, MAX_BATCH_PARTS)
@@ -221,13 +198,6 @@ impl<'a> OneHotNttWorkspace<'a> {
             return Err(AkitaMetalError::Shape(
                 "the limb kernel needs 256 threads per group".into(),
             ));
-        }
-        let mut source_map = Vec::new();
-        source_map.try_reserve_exact(rings).map_err(|_| {
-            AkitaMetalError::Shape(format!("cannot stage {rings} output-ring indices"))
-        })?;
-        for (id, count) in counts.into_iter().enumerate() {
-            source_map.extend(std::iter::repeat_n(to_u32(id)?, count));
         }
         let device = self.metal.device();
         let layouts = DeviceBuffer::from_slice(device, &layouts)?;
@@ -296,5 +266,75 @@ impl<'a> OneHotNttWorkspace<'a> {
         }
         let time = batch.commit_and_wait()?;
         Ok((out, time))
+    }
+}
+
+struct CommitLayout {
+    geometry: Geometry,
+    matrix_len: usize,
+    layouts: Vec<SourceParams>,
+    source_map: Vec<u32>,
+    rings: usize,
+    len: usize,
+    chunks: usize,
+}
+
+impl CommitLayout {
+    fn new(
+        matrix: &DeviceOneHotNttKey,
+        sources: &DeviceK16Sources,
+        shape: OneHotCommitShape,
+    ) -> Result<Self, AkitaMetalError> {
+        let geometry = Geometry::new(shape)?;
+        let matrix_len = checked::product([geometry.rows, geometry.columns, D])
+            .ok_or_else(|| AkitaMetalError::Shape("A matrix size overflows usize".into()))?;
+        if matrix_len > matrix.coefficient_count {
+            return Err(AkitaMetalError::Shape(format!(
+                "the A matrix view needs {matrix_len} coefficients; the key has {}",
+                matrix.coefficient_count
+            )));
+        }
+        let mut layouts = Vec::with_capacity(sources.sources.len());
+        let mut counts = Vec::with_capacity(sources.sources.len());
+        let mut rings = 0usize;
+        for source in &sources.sources {
+            let count = checked::product([geometry.blocks::<D>(source)?, geometry.rows])
+                .ok_or_else(|| {
+                    AkitaMetalError::Shape("source output size overflows usize".into())
+                })?;
+            layouts.push(SourceParams {
+                fields: to_u64(source.fields)?,
+                chunks: to_u64(source.chunks)?,
+                hot_offset: to_u64(source.hot_offset)?,
+                first_ring: to_u32(rings)?,
+                hot_stride: to_u32(source.hot_stride)?,
+            });
+            rings = checked::sum([rings, count]).ok_or_else(|| {
+                AkitaMetalError::Shape("output ring count overflows usize".into())
+            })?;
+            counts.push(count);
+        }
+        let len = checked::product([rings, D])
+            .ok_or_else(|| AkitaMetalError::Shape("output size overflows usize".into()))?;
+        checked::product([len, size_of::<F>()])
+            .ok_or_else(|| AkitaMetalError::Shape("output bytes overflow usize".into()))?;
+        let chunks = checked::div_ceil(geometry.positions, matrix.reconstruction_positions)
+            .ok_or_else(|| AkitaMetalError::Shape("invalid reconstruction bound".into()))?;
+        let mut source_map = Vec::new();
+        source_map.try_reserve_exact(rings).map_err(|_| {
+            AkitaMetalError::Shape(format!("cannot stage {rings} output-ring indices"))
+        })?;
+        for (id, count) in counts.into_iter().enumerate() {
+            source_map.extend(std::iter::repeat_n(to_u32(id)?, count));
+        }
+        Ok(Self {
+            geometry,
+            matrix_len,
+            layouts,
+            source_map,
+            rings,
+            len,
+            chunks,
+        })
     }
 }

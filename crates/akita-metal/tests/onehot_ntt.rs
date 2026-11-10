@@ -3,17 +3,18 @@
 
 use akita_algebra::CyclotomicRing;
 use akita_metal::onehot::{DeviceK16Sources, OneHotCommitShape};
-use akita_metal::onehot_ntt::{DeviceOneHotNttKey, OneHotNttWorkspace};
+use akita_metal::onehot_ntt::{DeviceOneHotNttKey, OneHotNttWorkspace, SharedKeyNttWorkspace};
 use akita_metal::{AkitaMetal, AkitaMetalError};
 use jolt_field::{Prime128OffsetA7F7 as F, Ring, Zero};
 
 const D: usize = 512;
-const COLUMNS: usize = 3;
+const COLUMNS: usize = 9;
 
 #[test]
 fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries() {
     let metal = AkitaMetal::new().expect("Metal device and shaders");
     let mut workspace = OneHotNttWorkspace::new(&metal);
+    let mut shared = SharedKeyNttWorkspace::new(&metal);
     for (positions, rank, digits) in [(4usize, 2, 3), (512, 1, 1)] {
         let shape = OneHotCommitShape {
             n_a: rank,
@@ -43,7 +44,9 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
                 selectors[row * COLUMNS] = if row < 32 { 0 } else { (row % 16) as u8 };
                 masks[row] = 1; // column zero commits digit zero too
                 selectors[row * COLUMNS + 1] = 15;
-                // Column two remains wholly absent despite zero selectors.
+                // The last column reaches the second sixteen-output tile.
+                selectors[row * COLUMNS + COLUMNS - 1] = 7;
+                // Columns two through seven remain absent despite zero selectors.
             }
         }
         let mut expected = Vec::new();
@@ -93,6 +96,12 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
                 .commit(&device_key, &source, shape)
                 .expect("commit");
             assert_eq!(out.read().expect("read output"), expected.as_slice());
+            if rank == 1 && digits == 1 {
+                let (out, _) = shared
+                    .commit(&device_key, &source, shape)
+                    .expect("shared-key commit");
+                assert_eq!(out.read().expect("shared-key output"), expected.as_slice());
+            }
         }
         let empty =
             DeviceK16Sources::from_row_major(&metal, Vec::new(), &[], COLUMNS, logical_rows)
@@ -101,6 +110,16 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
             .commit(&device_key, &empty, shape)
             .expect("zero commit");
         assert!(out.read().expect("zero output").iter().all(Zero::is_zero));
+        if rank == 1 && digits == 1 {
+            let (out, _) = shared
+                .commit(&device_key, &empty, shape)
+                .expect("shared-key empty reuse");
+            assert!(out
+                .read()
+                .expect("shared-key zero output")
+                .iter()
+                .all(Zero::is_zero));
+        }
     }
     // Failure after an earlier chunk may have completed must not publish a
     // partially initialized source. This adds no new proof fixture.

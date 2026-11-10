@@ -12,6 +12,67 @@ struct OneHotLimbParams {
     uint first_chunk, parts, direct_output;
 };
 
+inline void onehot_ntt16(thread uint* a, NttPrime prime,
+    device const uint* tw, device const uint* twq, uint modulus) {
+    for (uint half_len = 8; half_len >= 1; half_len /= 2)
+        for (uint start = 0; start < 16; start += 2 * half_len)
+            for (uint j = 0; j < half_len; j++) {
+                uint x = a[start + j], y = a[start + j + half_len];
+                a[start + j] = uint(csubp(prime, int(x + y)));
+                uint diff = uint(caddp(prime, int(x) - int(y)));
+                a[start + j + half_len] = j == 0 ? diff :
+                    shoup_mul_canonical(diff, tw[j * (8 / half_len)], twq[j * (8 / half_len)], modulus);
+            }
+}
+
+// At most eight canonical products with p < 2^30. The sum plus its
+// Montgomery correction fits u64, and the quotient is below 3p.
+inline uint onehot_limb_dot_reduce(ulong sum, NttPrime prime, uint modulus) {
+    uint correction = uint(sum) * (0u - uint(prime.pinv));
+    uint value = uint((sum + ulong(correction) * modulus) >> 32);
+    value = metal::select(value, value - modulus, value >= modulus);
+    return metal::select(value, value - modulus, value >= modulus);
+}
+
+template <uint C, uint MODULUS>
+inline void onehot_limb_inverse(threadgroup uint* work, device const uint* tables,
+    device jolt::Fp128<C>* out, constant OneHotLimbParams& p, uint group, uint tid) {
+    using F = jolt::Fp128<C>;
+    NttPrime prime = p.prime;
+    prime.p = int(MODULUS);
+    uint modulus = MODULUS;
+    device const uint* invw = tables + 16400;
+    device const uint* invwq = invw + 256;
+    device const uint* untwist = invwq + 256;
+    device const uint* untwistq = untwist + 512;
+    for (uint len = 2; len <= 512; len *= 2) {
+        uint half_len = len / 2;
+        for (uint i = tid; i < 2048; i += 256) {
+            uint limb = i / 256, b = i % 256, j = b % half_len, start = (b / half_len) * len;
+            uint lo = limb * 512 + start + j, hi = lo + half_len;
+            uint u = work[lo];
+            uint v = shoup_mul_canonical(work[hi], invw[j * (512 / len)], invwq[j * (512 / len)], modulus);
+            work[lo] = uint(csubp(prime, int(u + v)));
+            work[hi] = uint(caddp(prime, int(u) - int(v)));
+        }
+        metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    }
+    for (uint coeff = tid; coeff < 512; coeff += 256) {
+        long carry = 0; uint4 lo(0u);
+        for (uint limb = 0; limb < 8; limb++) {
+            uint residue = shoup_mul_canonical(work[limb * 512 + coeff], untwist[coeff], untwistq[coeff], modulus);
+            long centered = residue > modulus / 2 ? long(residue) - modulus : long(residue);
+            long v = centered + carry;
+            lo[limb / 2] |= uint(ushort(v)) << (16 * (limb % 2));
+            carry = v >> 16;
+        }
+        F value{jolt::fp128_detail::fold2_canonicalize<C>(lo, 0)};
+        value = value + F::from_i64(carry * long(C));
+        ulong index = ulong(group) * 512 + coeff;
+        out[index] = p.direct_output && p.first_chunk != 0 ? out[index] + value : value;
+    }
+}
+
 template <uint C, uint DOT_BATCH, uint MODULUS, typename KeyIndex>
 kernel void akita_onehot_limb_commit(
     device const uchar* hot [[buffer(0)]],
@@ -86,15 +147,7 @@ kernel void akita_onehot_limb_commit(
                     }
                     uint a[16];
                     for (uint v = 0; v < 16; v++) a[v] = work[r * 512 + v * 32 + c];
-                    for (uint half_len = 8; half_len >= 1; half_len /= 2)
-                        for (uint start = 0; start < 16; start += 2 * half_len)
-                            for (uint j = 0; j < half_len; j++) {
-                                uint x = a[start + j], y = a[start + j + half_len];
-                                a[start + j] = uint(csubp(prime, int(x + y)));
-                                uint diff = uint(caddp(prime, int(x) - int(y)));
-                                a[start + j + half_len] = j == 0 ? diff :
-                                    shoup_mul_canonical(diff, tw[j * (8 / half_len)], twq[j * (8 / half_len)], modulus);
-                            }
+                    onehot_ntt16(a, prime, tw, twq, modulus);
                     for (uint v = 0; v < 16; v++) {
                         uint rev = ((v & 1) << 3) | ((v & 2) << 1) | ((v & 4) >> 1) | ((v & 8) >> 3);
                         work[r * 512 + rev * 32 + c] = a[v];
@@ -109,13 +162,7 @@ kernel void akita_onehot_limb_commit(
             for (uint r = 0; r < DOT_BATCH; r++) if (first + r < end) {
                 sum += ulong(key[first_key + KeyIndex(r) * key_stride + idx]) * work[r * 512 + coeff];
             }
-            // At most eight canonical products with p < 2^30. The sum plus
-            // its Montgomery correction fits u64; the quotient is below 3p.
-            uint correction = uint(sum) * (0u - uint(p.prime.pinv));
-            uint v = uint((sum + ulong(correction) * modulus) >> 32);
-            // v can exceed i32::MAX before the two reductions.
-            v = metal::select(v, v - modulus, v >= modulus);
-            v = metal::select(v, v - modulus, v >= modulus);
+            uint v = onehot_limb_dot_reduce(sum, prime, modulus);
             acc[i] = uint(csubp(prime, int(acc[i] + v)));
         }
         metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -125,32 +172,7 @@ kernel void akita_onehot_limb_commit(
         work[(idx / 512) * 512 + (metal::reverse_bits(idx % 512) >> 23)] = acc[i];
     }
     metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    for (uint len = 2; len <= 512; len *= 2) {
-        uint half_len = len / 2;
-        for (uint i = tid; i < 2048; i += 256) {
-            uint limb = i / 256, b = i % 256, j = b % half_len, start = (b / half_len) * len;
-            uint lo = limb * 512 + start + j, hi = lo + half_len;
-            uint u = work[lo];
-            uint v = shoup_mul_canonical(work[hi], invw[j * (512 / len)], invwq[j * (512 / len)], modulus);
-            work[lo] = uint(csubp(prime, int(u + v)));
-            work[hi] = uint(caddp(prime, int(u) - int(v)));
-        }
-        metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    }
-    for (uint coeff = tid; coeff < 512; coeff += 256) {
-        long carry = 0; uint4 lo(0u);
-        for (uint limb = 0; limb < 8; limb++) {
-            uint residue = shoup_mul_canonical(work[limb * 512 + coeff], untwist[coeff], untwistq[coeff], modulus);
-            long centered = residue > modulus / 2 ? long(residue) - modulus : long(residue);
-            long v = centered + carry;
-            lo[limb / 2] |= uint(ushort(v)) << (16 * (limb % 2));
-            carry = v >> 16;
-        }
-        F value{jolt::fp128_detail::fold2_canonicalize<C>(lo, 0)};
-        value = value + F::from_i64(carry * long(C));
-        ulong index = ulong(group) * 512 + coeff;
-        out[index] = p.direct_output && p.first_chunk != 0 ? out[index] + value : value;
-    }
+    onehot_limb_inverse<C, MODULUS>(work, tables, out, p, group, tid);
 }
 
 template <uint C>

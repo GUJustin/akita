@@ -35,6 +35,10 @@ impl AkitaMetal {
                 include_str!("../shaders/akita/onehot_ntt.metal"),
             ),
             (
+                "akita/onehot_shared_ntt.metal",
+                include_str!("../shaders/akita/onehot_shared_ntt.metal"),
+            ),
+            (
                 "akita/onehot_fold.metal",
                 include_str!("../shaders/akita/onehot_fold.metal"),
             ),
