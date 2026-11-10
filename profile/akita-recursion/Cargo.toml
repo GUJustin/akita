@@ -45,10 +45,11 @@ ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist
 ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 
-# Jolt's `jolt-akita` pins Akita by git rev; build it against this checkout so the
+# This Jolt revision pins the GUJustin Akita fork; build it against this checkout so the
 # profile graph carries one Akita and one `jolt-field` identity.
-[patch."https://github.com/LayerZero-Labs/akita.git"]
+[patch."https://github.com/GUJustin/akita.git"]
 akita-algebra = { path = "../../crates/akita-algebra" }
+akita-metal = { path = "../../crates/akita-metal" }
 akita-challenges = { path = "../../crates/akita-challenges" }
 akita-config = { path = "../../crates/akita-config" }
 akita-cpu-backend = { path = "../../crates/akita-cpu-backend" }
