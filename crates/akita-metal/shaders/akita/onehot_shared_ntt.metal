@@ -22,6 +22,11 @@ kernel void akita_onehot_shared_source(
     ulong first = (ulong(block) * p.positions + position) * 32;
     ulong live = metal::min(source.chunks, source.fields / 16);
     uint a[16] = {};
+    // Four SIMD groups own disjoint sets of sixteen bins per lane (8 KiB).
+    // Each lane initializes, updates and reads only its own words, so there
+    // are no cross-lane consumers and no additional barrier is needed.
+    threadgroup uint bins[2048];
+    uint bin_base = ((index / 32) % 4) * 512 + lane;
     NttPrime prime = p.prime;
     prime.p = int(MODULUS);
     if (position < p.positions && first < live) {
@@ -31,11 +36,16 @@ kernel void akita_onehot_shared_source(
             for (uint v = 0; v < 16; v++)
                 a[v] = tables[17936 + kind * 512 + v * 32 + lane];
         } else if (kind != 255) {
+            for (uint v = 0; v < 16; v++) bins[bin_base + v * 32] = 0;
             for (uint row = 0; row < present; row++) {
                 uint digit = hot[source.hot_offset + (first + row) * source.hot_stride];
-                if (digit != 255)
-                    a[digit] = uint(csubp(prime, int(a[digit] + tables[(digit * 32 + row) * 32 + lane])));
+                if (digit != 255) {
+                    uint root = tables[(digit * 32 + row) * 32 + lane];
+                    uint offset = bin_base + digit * 32;
+                    bins[offset] = uint(csubp(prime, int(bins[offset] + root)));
+                }
             }
+            for (uint v = 0; v < 16; v++) a[v] = bins[bin_base + v * 32];
             onehot_ntt16(a, prime, tables + 16384, tables + 16392, MODULUS);
             for (uint v = 0; v < 16; v++) {
                 uint rev = ((v & 1) << 3) | ((v & 2) << 1) | ((v & 4) >> 1) | ((v & 8) >> 3);
