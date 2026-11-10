@@ -4,7 +4,7 @@
 use akita_algebra::CyclotomicRing;
 use akita_metal::onehot::{DeviceK16Sources, OneHotCommitShape};
 use akita_metal::onehot_ntt::{DeviceOneHotNttKey, OneHotNttWorkspace};
-use akita_metal::AkitaMetal;
+use akita_metal::{AkitaMetal, AkitaMetalError};
 use jolt_field::{Prime128OffsetA7F7 as F, Ring, Zero};
 
 const D: usize = 512;
@@ -65,10 +65,30 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
             }
             expected.extend(rings.iter().flat_map(|ring| *ring.coefficients()));
         }
-        let source =
-            DeviceK16Sources::from_row_major(&metal, selectors, &masks, COLUMNS, logical_rows)
-                .expect("row-major source");
-        for _ in 0..2 {
+        for direct in [false, true] {
+            let source = if direct {
+                DeviceK16Sources::from_row_major_producer(
+                    &metal,
+                    COLUMNS,
+                    prefix,
+                    logical_rows,
+                    |first, output, output_masks| {
+                        let start = first * COLUMNS;
+                        output.copy_from_slice(&selectors[start..start + output.len()]);
+                        output_masks.copy_from_slice(&masks[first..first + output_masks.len()]);
+                        Ok(())
+                    },
+                )
+            } else {
+                DeviceK16Sources::from_row_major(
+                    &metal,
+                    selectors.clone(),
+                    &masks,
+                    COLUMNS,
+                    logical_rows,
+                )
+            }
+            .expect("row-major source");
             let (out, _) = workspace
                 .commit(&device_key, &source, shape)
                 .expect("commit");
@@ -82,4 +102,21 @@ fn row_major_commitments_preserve_zeros_prefixes_and_reconstruction_boundaries()
             .expect("zero commit");
         assert!(out.read().expect("zero output").iter().all(Zero::is_zero));
     }
+    // Failure after an earlier chunk may have completed must not publish a
+    // partially initialized source. This adds no new proof fixture.
+    let failed = DeviceK16Sources::from_row_major_producer(
+        &metal,
+        COLUMNS,
+        8193,
+        8224,
+        |first, selected, masks| {
+            if first != 0 {
+                return Err(AkitaMetalError::Shape("injected producer failure".into()));
+            }
+            selected.fill(0);
+            masks.fill(1);
+            Ok(())
+        },
+    );
+    assert!(failed.is_err());
 }
